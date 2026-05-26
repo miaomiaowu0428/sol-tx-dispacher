@@ -1,0 +1,46 @@
+[package]
+name = "sol-tx-dispacher"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = [
+    "astralane",
+    "astralane_quic",
+    "everstake",
+    "everstake_quic",
+    "flash_block",
+    "nodeone",
+    "blockrazor",
+    "temporal",
+    "helius",
+    "zeroslot",
+    "nextblock",
+    "stellium",
+    "jito",
+    "harmonic",
+]
+astralane       = []
+astralane_quic  = []
+everstake       = []
+everstake_quic  = []
+flash_block     = []
+nodeone         = []
+blockrazor      = []
+temporal        = []
+helius          = []
+zeroslot        = []
+nextblock       = []
+stellium        = []
+jito            = []
+harmonic        = []
+
+[dependencies]
+sol-slot-leader = { path = "../sol-slot-leader" }
+sol-tx-send     = { path = "../sol-tx-sender" }
+nonce_cache     = { path = "../nonce_cache" }
+tokio           = { version = "1", features = ["full"] }
+log             = "0.4"
+anyhow          = "1"
+solana-sdk      = "3.0.0"
+solana-client   = "3.1.11"
