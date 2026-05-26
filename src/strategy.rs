@@ -70,9 +70,26 @@ async fn harmonic_mode(
         };
     }
 
-    // Harmonic 直发：按 tip_strategy，不带 cu_price
+    // Harmonic：将 tip_strategy 转为 cu_price（Harmonic 竞价 = priority fee，无需 SOL 转账）
+    //
+    // 公式：cu_price (micro-lamports/CU) = tip_lamports × 1_000_000 / cu_limit
+    // 外界只管传 tip_strategy，此处偷偷做转换，对调用方透明。
+    // HarmonicBlockEngine::uses_tip_transfer()=false，不管传什么 tip 都不会生成 SOL 转账指令。
     #[cfg(feature = "harmonic")]
-    fire_no_price!(d.harmonic, tip: tip_strategy);
+    if let Some(c) = &d.harmonic {
+        let cu_limit = cu.0.unwrap_or(200_000) as u64;
+        let tip_lamports = tip_strategy
+            .map(|s| s.compute(0)) // Harmonic min=0；Absolute(n)→n，Ratio→0
+            .unwrap_or(0);
+        let harmonic_cu_price = if cu_limit > 0 && tip_lamports > 0 {
+            tip_lamports.saturating_mul(1_000_000) / cu_limit
+        } else {
+            0
+        };
+        let harmonic_cu = (cu.0, if harmonic_cu_price > 0 { Some(harmonic_cu_price) } else { None });
+        // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
+        fire_client(c, ixs, &ctx.payer, None, &ctx.hash_param, &harmonic_cu, &ctx.alt, None, &mut sigs);
+    }
 
     // AstralaneQuic / Temporal：tip_strategy × 0.9，不带 cu_price
     #[cfg(feature = "astralane_quic")]
