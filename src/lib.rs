@@ -150,8 +150,10 @@ impl TxDispacher {
     }
 
     /// 查询当前 slot 的路由决策（不发送）。
-    pub fn resolve_route(&self, current_slot: u64) -> SendRoute {
-        match self.oracle.leader_at(current_slot + 1) {
+    /// 查询 `target_slot` 的 leader 类型并返回路由决策。
+    /// 调用方自行决定传当前 slot 还是 current_slot + N。
+    pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
+        match self.oracle.leader_at(target_slot) {
             Some(info) if info.is_harmonic() => SendRoute::Harmonic,
             _ => SendRoute::Fallback,
         }
@@ -160,6 +162,10 @@ impl TxDispacher {
     /// 主发送入口。
     ///
     /// - `tip_strategy` 为 `None` 时各策略使用内置默认：
+    /// - `target_slot`：预期交易落地的 slot。调用方自行决定偏移量：
+    ///   - 信号与交易同 slot（最常见）→ 直接传 `signal_slot`
+    ///   - 信号在 slot 末尾、交易可能落下一个 slot → 传 `signal_slot + 1`
+    /// - `tip_strategy` 为 `None` 时各策略使用内置默认：
     ///   - `Harmonic` leader：Astralane / Temporal 按 90% tip，Harmonic 路径不加 tip
     ///   - `Fallback`：各平台按自身最低 tip
     /// - 显式传入 `tip_strategy` 会覆盖默认值。
@@ -167,13 +173,13 @@ impl TxDispacher {
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
         ctx: &SendContext,
-        current_slot: u64,
+        target_slot: u64,
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
     ) -> anyhow::Result<solana_sdk::signature::Signature> {
-        let route = self.resolve_route(current_slot);
-        log::info!("[TxDispacher] slot={} route={:?}", current_slot, route);
+        let route = self.resolve_route(target_slot);
+        log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
         strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs).await
     }
 }
