@@ -101,6 +101,8 @@ use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 pub enum SendRoute {
     /// Harmonic 系节点出块：走 Harmonic 直发 + Astralane/Temporal 90% tip
     Harmonic,
+    /// Jito 节点出块：只发带 tip 的版本，跳过纯 cu_price 的交易
+    Jito,
     /// 其他所有节点（含 DB 无记录 / NoopOracle）：退化到 send_fast
     Fallback,
 }
@@ -155,7 +157,8 @@ impl<O: SlotOracle> TxDispacher<O> {
     pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
         match self.oracle.leader_at(target_slot) {
             Some(info) if info.is_harmonic() => SendRoute::Harmonic,
-            _ => SendRoute::Fallback,
+            Some(info) if info.is_jito()     => SendRoute::Jito,
+            _                                => SendRoute::Fallback,
         }
     }
 

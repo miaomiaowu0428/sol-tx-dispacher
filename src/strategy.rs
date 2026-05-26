@@ -21,6 +21,7 @@ pub(crate) async fn dispatch<O: SlotOracle>(
 ) -> anyhow::Result<Signature> {
     let result = match route {
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
+        SendRoute::Jito     => jito_mode(d, ixs, ctx, tip_strategy, timeout_secs).await,
         SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
     result.map_err(|e| anyhow::anyhow!("send failed: {}", e))
@@ -139,6 +140,52 @@ async fn harmonic_mode<O: SlotOracle>(
     log::info!("[harmonic_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
 }
+
+// ── jito_mode ─────────────────────────────────────────────────────────────────
+
+/// Jito 节点出块：只发带 tip 的版本，跳过所有纯 cu_price 的交易。
+///
+/// Jito 的出块优先级由 tip（SOL 转账）决定，cu_price 对排序几乎无帮助。
+/// 所以只发 `fire_no_price!` 版本（有 tip 无 cu_price），
+/// 原来仅 `fire_with_price!` 的平台直接跳过。
+async fn jito_mode<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    timeout_secs: u64,
+) -> Result<Signature, TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cu_no_price = (None, None); // 不带 cu_limit 也不带 cu_price
+
+    macro_rules! fire_tip_only {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(tip_strategy, min);
+                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, None, &mut sigs);
+            }
+        };
+    }
+
+    // 只发带 tip 的版本：fire_both 平台取 no_price 那笔，fire_with_price 平台跳过
+    #[cfg(feature = "astralane_quic")]  fire_tip_only!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_tip_only!(d.astralane);
+
+    #[cfg(feature = "flash_block")]     fire_tip_only!(d.flash_block);
+    #[cfg(feature = "temporal")]        fire_tip_only!(d.temporal);
+    #[cfg(feature = "zeroslot")]        fire_tip_only!(d.zeroslot);
+    #[cfg(feature = "jito")]            fire_tip_only!(d.jito);
+
+    // everstake_quic / everstake / nodeone / blockrazor / helius / nextblock / stellium
+    // 这些平台在 fallback 里只发 cu_price 版本，Jito 模式下跳过
+
+    log::info!("[jito_mode] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
+}
+
 // ── fallback_mode ─────────────────────────────────────────────────────────────
 
 async fn fallback_mode<O: SlotOracle>(
