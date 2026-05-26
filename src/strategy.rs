@@ -82,11 +82,14 @@ async fn harmonic_mode<O: SlotOracle>(
         let tip_lamports = tip_strategy
             .map(|s| s.compute(0)) // Harmonic min=0；Absolute(n)→n，Ratio→0
             .unwrap_or(0);
-        let harmonic_cu_price = if cu_limit > 0 && tip_lamports > 0 {
+        let tip_derived_cu_price = if cu_limit > 0 && tip_lamports > 0 {
             tip_lamports.saturating_mul(1_000_000) / cu_limit
         } else {
             0
         };
+        // 取 MAX：tip 转换值 vs 调用方原始 cu_price
+        // Harmonic revert protection 保证失败不付钱，取高的竞价更有力且无额外风险
+        let harmonic_cu_price = tip_derived_cu_price.max(cu.1.unwrap_or(0));
         let harmonic_cu = (cu.0, if harmonic_cu_price > 0 { Some(harmonic_cu_price) } else { None });
         // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
         fire_client(c, ixs, &ctx.payer, None, &ctx.hash_param, &harmonic_cu, &ctx.alt, None, &mut sigs);
