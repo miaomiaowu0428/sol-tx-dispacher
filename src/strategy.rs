@@ -212,8 +212,19 @@ async fn fallback_mode(
     #[cfg(feature = "everstake_quic")]
     fire_with_price!(d.everstake_quic, tip: Some(TipStrategy::Ratio(1.05)));
 
+    // everstake_quic 开启时 HTTP 版自动跳过，quic 未开启时按 feature 决定
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_with_price!(d.everstake, tip: Some(TipStrategy::Ratio(1.05)));
+
     #[cfg(feature = "astralane_quic")]
     fire_both!(d.astralane_quic,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+
+    // astralane_quic 开启时 HTTP 版自动跳过，quic 未开启时按 feature 决定
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_both!(d.astralane,
         with_price: Some(TipStrategy::Ratio(1.05)),
         no_price:   tip_strategy,
     );
@@ -224,14 +235,7 @@ async fn fallback_mode(
         no_price:   tip_strategy,
     );
 
-    #[cfg(feature = "everstake")]
-    fire_with_price!(d.everstake, tip: Some(TipStrategy::Ratio(1.05)));
 
-    #[cfg(feature = "astralane")]
-    fire_both!(d.astralane,
-        with_price: Some(TipStrategy::Ratio(1.05)),
-        no_price:   tip_strategy,
-    );
 
     #[cfg(feature = "nodeone")]
     fire_with_price!(d.nodeone, tip: Some(TipStrategy::Ratio(1.05)));

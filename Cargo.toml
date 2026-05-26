@@ -20,6 +20,22 @@ default = [
     "jito",
     "harmonic",
 ]
+full = [
+    "astralane",
+    "astralane_quic",
+    "everstake",
+    "everstake_quic",
+    "flash_block",
+    "nodeone",
+    "blockrazor",
+    "temporal",
+    "helius",
+    "zeroslot",
+    "nextblock",
+    "stellium",
+    "jito",
+    "harmonic",
+]
 astralane       = []
 astralane_quic  = []
 everstake       = []
