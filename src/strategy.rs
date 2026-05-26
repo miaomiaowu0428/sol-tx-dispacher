@@ -4,13 +4,14 @@
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
 use crate::{SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
+use sol_slot_leader::SlotOracle;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
 use std::collections::HashSet;
 
-pub(crate) async fn dispatch(
-    d: &TxDispacher,
+pub(crate) async fn dispatch<O: SlotOracle>(
+    d: &TxDispacher<O>,
     ixs: &[Instruction],
     ctx: &SendContext,
     route: SendRoute,
@@ -45,8 +46,8 @@ fn tip_or_default(strategy: Option<TipStrategy>, platform_min: u64, default_rati
 
 // ── harmonic_mode ─────────────────────────────────────────────────────────────
 
-async fn harmonic_mode(
-    d: &TxDispacher,
+async fn harmonic_mode<O: SlotOracle>(
+    d: &TxDispacher<O>,
     ixs: &[Instruction],
     ctx: &SendContext,
     tip_strategy: Option<TipStrategy>,
@@ -137,8 +138,8 @@ async fn harmonic_mode(
 }
 // ── fallback_mode ─────────────────────────────────────────────────────────────
 
-async fn fallback_mode(
-    d: &TxDispacher,
+async fn fallback_mode<O: SlotOracle>(
+    d: &TxDispacher<O>,
     ixs: &[Instruction],
     ctx: &SendContext,
     tip_strategy: Option<TipStrategy>,

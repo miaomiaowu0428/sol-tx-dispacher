@@ -34,8 +34,8 @@ use sol_tx_send::platform_clients::jito::Jito;
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 
 /// TxDispacher 构建器。
-pub struct TxDispacherBuilder {
-    oracle: Arc<dyn SlotOracle>,
+pub struct TxDispacherBuilder<O: SlotOracle> {
+    oracle: O,
 
     #[cfg(feature = "astralane")]
     astralane: Option<Arc<Astralane>>,
@@ -67,8 +67,8 @@ pub struct TxDispacherBuilder {
     harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
 
-impl TxDispacherBuilder {
-    pub(crate) fn new(oracle: Arc<dyn SlotOracle>) -> Self {
+impl<O: SlotOracle> TxDispacherBuilder<O> {
+    pub(crate) fn new(oracle: O) -> Self {
         Self {
             oracle,
             #[cfg(feature = "astralane")]      astralane:      None,
@@ -134,7 +134,7 @@ impl TxDispacherBuilder {
 
     // ── build ─────────────────────────────────────────────────────────────
 
-    pub fn build(self) -> TxDispacher {
+    pub fn build(self) -> TxDispacher<O> {
         TxDispacher {
             oracle: self.oracle,
             #[cfg(feature = "astralane")]      astralane:      self.astralane,

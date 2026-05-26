@@ -110,8 +110,8 @@ pub enum SendRoute {
 /// slot-aware 交易分发器。
 ///
 /// 通过 [`TxDispacherBuilder`] 构造，各平台客户端按 feature 开关。
-pub struct TxDispacher {
-    oracle: Arc<dyn SlotOracle>,
+pub struct TxDispacher<O: SlotOracle> {
+    oracle: O,
 
     #[cfg(feature = "astralane")]
     pub(crate) astralane: Option<Arc<Astralane>>,
@@ -143,9 +143,9 @@ pub struct TxDispacher {
     pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
 
-impl TxDispacher {
+impl<O: SlotOracle> TxDispacher<O> {
     /// 返回 builder。
-    pub fn builder(oracle: Arc<dyn SlotOracle>) -> TxDispacherBuilder {
+    pub fn builder(oracle: O) -> TxDispacherBuilder<O> {
         TxDispacherBuilder::new(oracle)
     }
 
@@ -240,7 +240,7 @@ mod tests {
             harmonic: false,                        // client_type = Agave
             name: Some("Harmonic-SG"),              // name 含 harmonic
         };
-        let d = TxDispacher::builder(Arc::new(oracle)).build();
+        let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
     }
 
@@ -268,7 +268,7 @@ mod tests {
     async fn _full_usage_example() {
         // ── 1. 构造 Oracle ──────────────────────────────────────────────────
         // 有 DB：
-        //   let oracle = Arc::new(
+        //   let oracle = (
         //       sol_slot_leader::SlotLeaderCache::new(
         //           sol_slot_leader::DbConfig::new("mysql://..."),
         //           "https://rpc.example.com",
@@ -277,7 +277,7 @@ mod tests {
         //   oracle.spawn_refresh_task();
         //
         // 无 DB（旧项目 fallback，行为等价原 send_fast）：
-        let oracle: Arc<dyn SlotOracle> = Arc::new(NoopOracle);
+        let oracle = NoopOracle;
 
         // ── 2. 构造 Dispacher，链式注入各平台 ──────────────────────────────
         let dispacher = TxDispacher::builder(oracle)
