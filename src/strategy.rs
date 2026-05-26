@@ -4,6 +4,7 @@
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
 use crate::{SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
+use grpc_client::TransactionFormat;
 use sol_slot_leader::SlotOracle;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_tx_send::platform_clients::BuildTx;
@@ -18,7 +19,7 @@ pub(crate) async fn dispatch<O: SlotOracle>(
     tip_strategy: Option<TipStrategy>,
     cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
-) -> anyhow::Result<Signature> {
+) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Jito     => jito_mode(d, ixs, ctx, tip_strategy, timeout_secs).await,
@@ -54,7 +55,7 @@ async fn harmonic_mode<O: SlotOracle>(
     tip_strategy: Option<TipStrategy>,
     cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
-) -> Result<Signature, TxConfirmError> {
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
     let cu_no_price = (cu.0, None);
@@ -138,7 +139,7 @@ async fn harmonic_mode<O: SlotOracle>(
     fire_no_price!(d.jito, tip: tip_strategy);
 
     log::info!("[harmonic_mode] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
+    confirm_tx(rx, sigs, timeout_secs).await
 }
 
 // ── jito_mode ─────────────────────────────────────────────────────────────────
@@ -154,7 +155,7 @@ async fn jito_mode<O: SlotOracle>(
     ctx: &SendContext,
     tip_strategy: Option<TipStrategy>,
     timeout_secs: u64,
-) -> Result<Signature, TxConfirmError> {
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
     let cu_no_price = (None, None); // 不带 cu_limit 也不带 cu_price
@@ -183,7 +184,7 @@ async fn jito_mode<O: SlotOracle>(
     // 这些平台在 fallback 里只发 cu_price 版本，Jito 模式下跳过
 
     log::info!("[jito_mode] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
+    confirm_tx(rx, sigs, timeout_secs).await
 }
 
 // ── fallback_mode ─────────────────────────────────────────────────────────────
@@ -195,7 +196,7 @@ async fn fallback_mode<O: SlotOracle>(
     tip_strategy: Option<TipStrategy>,
     cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
-) -> Result<Signature, TxConfirmError> {
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
     let cu_no_price = (cu.0, None);
@@ -320,7 +321,7 @@ async fn fallback_mode<O: SlotOracle>(
     fire_no_price!(d.jito, tip: tip_strategy);
 
     log::info!("[fallback_mode] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
+    confirm_tx(rx, sigs, timeout_secs).await
 }
 
 // ── dispatch_cheap ─────────────────────────────────────────────────────────────
@@ -336,7 +337,7 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     tip_strategy: Option<TipStrategy>,
     cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
-) -> anyhow::Result<Signature> {
+) -> anyhow::Result<(Signature, TransactionFormat)> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
 
@@ -369,6 +370,5 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     log::info!("[dispatch_cheap] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
-        .map(|(sig, _)| sig)
         .map_err(|e| anyhow::anyhow!("send_cheap failed: {}", e))
 }

@@ -180,7 +180,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<solana_sdk::signature::Signature> {
+    ) -> anyhow::Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat)> {
         let route = self.resolve_route(target_slot);
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
         strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs).await
@@ -197,7 +197,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<solana_sdk::signature::Signature> {
+    ) -> anyhow::Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat)> {
         strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
     }
 }

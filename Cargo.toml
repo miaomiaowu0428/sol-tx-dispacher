@@ -52,9 +52,10 @@ jito            = []
 harmonic        = []
 
 [dependencies]
-sol-slot-leader = { path = "../sol-slot-leader" }
-sol-tx-send     = { path = "../sol-tx-sender" }
-nonce_cache     = { path = "../nonce_cache" }
+sol-slot-leader = { git = "https://github.com/miaomiaowu0428/sol-slot-leader.git" }
+sol-tx-send     = { git = "https://github.com/miaomiaowu0428/sol-tx-sender.git" }
+nonce_cache     = { git = "https://github.com/miaomiaowu0428/nonce_cache.git" }
+grpc-client     = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
 tokio           = { version = "1", features = ["full"] }
 log             = "0.4"
 anyhow          = "1"
