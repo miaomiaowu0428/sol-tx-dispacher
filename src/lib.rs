@@ -185,6 +185,21 @@ impl<O: SlotOracle> TxDispacher<O> {
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
         strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs).await
     }
+
+    /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
+    ///
+    /// 适合卖出等不极限抢速的场景，屾岜山全量平台广播带来的额外费用。
+    /// - 或者直接不带 tip/cu_price （传 `None`）走平台默认最低费。
+    pub async fn send_cheap(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        tip_strategy: Option<TipStrategy>,
+        cu: (Option<u32>, Option<u64>),
+        confirm_timeout_secs: u64,
+    ) -> anyhow::Result<solana_sdk::signature::Signature> {
+        strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
+    }
 }
 
 #[cfg(test)]

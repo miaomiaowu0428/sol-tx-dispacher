@@ -322,3 +322,53 @@ async fn fallback_mode<O: SlotOracle>(
     log::info!("[fallback_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await.map(|(sig, _)| sig)
 }
+
+// ── dispatch_cheap ─────────────────────────────────────────────────────────────
+
+/// 低成本发送：不走 oracle 路由，只发少数几家平台单轮，省费用。
+///
+/// 选取原则：接受 tip 且延迟低的平台，不做双轮竞价。
+/// 对应原 `send_utils::send_cheap` 的平台选择逻辑。
+pub(crate) async fn dispatch_cheap<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    cu: (Option<u32>, Option<u64>),
+    timeout_secs: u64,
+) -> anyhow::Result<Signature> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    macro_rules! fire_cheap {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(tip_strategy, min);
+                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
+            }
+        };
+    }
+
+    // QUIC 优先；有 QUIC 时对应 HTTP 版自动跳过
+    #[cfg(feature = "everstake_quic")]
+    fire_cheap!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_cheap!(d.everstake);
+
+    #[cfg(feature = "astralane_quic")]
+    fire_cheap!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_cheap!(d.astralane);
+
+    // 少数 HTTP 平台
+    #[cfg(feature = "flash_block")]     fire_cheap!(d.flash_block);
+    // Jito（靠 tip 排序，便宜但有效）
+    #[cfg(feature = "jito")]            fire_cheap!(d.jito);
+
+    log::info!("[dispatch_cheap] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map(|(sig, _)| sig)
+        .map_err(|e| anyhow::anyhow!("send_cheap failed: {}", e))
+}
