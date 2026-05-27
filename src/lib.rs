@@ -69,30 +69,30 @@ impl TipStrategy {
 use sol_tx_send::platform_clients::astralane::Astralane;
 #[cfg(feature = "astralane_quic")]
 use sol_tx_send::platform_clients::astralane_quic::client::AstralaneQuic;
+#[cfg(feature = "blockrazor")]
+use sol_tx_send::platform_clients::blockrazor::Blockrazor;
 #[cfg(feature = "everstake")]
 use sol_tx_send::platform_clients::ever_stake::EverStake;
 #[cfg(feature = "everstake_quic")]
 use sol_tx_send::platform_clients::ever_stake_quic::EverStakeQuic;
 #[cfg(feature = "flash_block")]
 use sol_tx_send::platform_clients::flash_block::FlashBlock;
-#[cfg(feature = "nodeone")]
-use sol_tx_send::platform_clients::nodeone::NodeOne;
-#[cfg(feature = "blockrazor")]
-use sol_tx_send::platform_clients::blockrazor::Blockrazor;
-#[cfg(feature = "temporal")]
-use sol_tx_send::platform_clients::temporal::Temporal;
-#[cfg(feature = "helius")]
-use sol_tx_send::platform_clients::helius::Helius;
-#[cfg(feature = "zeroslot")]
-use sol_tx_send::platform_clients::zeroslot::ZeroSlot;
-#[cfg(feature = "nextblock")]
-use sol_tx_send::platform_clients::nextblock::NextBlock;
-#[cfg(feature = "stellium")]
-use sol_tx_send::platform_clients::stellium::Stellium;
-#[cfg(feature = "jito")]
-use sol_tx_send::platform_clients::jito::Jito;
 #[cfg(feature = "harmonic")]
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
+#[cfg(feature = "helius")]
+use sol_tx_send::platform_clients::helius::Helius;
+#[cfg(feature = "jito")]
+use sol_tx_send::platform_clients::jito::Jito;
+#[cfg(feature = "nextblock")]
+use sol_tx_send::platform_clients::nextblock::NextBlock;
+#[cfg(feature = "nodeone")]
+use sol_tx_send::platform_clients::nodeone::NodeOne;
+#[cfg(feature = "stellium")]
+use sol_tx_send::platform_clients::stellium::Stellium;
+#[cfg(feature = "temporal")]
+use sol_tx_send::platform_clients::temporal::Temporal;
+#[cfg(feature = "zeroslot")]
+use sol_tx_send::platform_clients::zeroslot::ZeroSlot;
 
 // ── 发送路由决策 ──────────────────────────────────────────────────────────────
 
@@ -157,8 +157,8 @@ impl<O: SlotOracle> TxDispacher<O> {
     pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
         match self.oracle.leader_at(target_slot) {
             Some(info) if info.is_harmonic() => SendRoute::Harmonic,
-            Some(info) if info.is_jito()     => SendRoute::Jito,
-            _                                => SendRoute::Fallback,
+            Some(info) if info.is_jito() => SendRoute::Jito,
+            _ => SendRoute::Fallback,
         }
     }
 
@@ -180,10 +180,22 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat)> {
+    ) -> anyhow::Result<(
+        solana_sdk::signature::Signature,
+        grpc_client::TransactionFormat,
+    )> {
         let route = self.resolve_route(target_slot);
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
-        strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs).await
+        strategy::dispatch(
+            self,
+            ixs,
+            ctx,
+            route,
+            tip_strategy,
+            cu,
+            confirm_timeout_secs,
+        )
+        .await
     }
 
     /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
@@ -197,7 +209,10 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat)> {
+    ) -> anyhow::Result<(
+        solana_sdk::signature::Signature,
+        grpc_client::TransactionFormat,
+    )> {
         strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
     }
 }
@@ -241,13 +256,21 @@ mod tests {
 
     #[test]
     fn harmonic_client_type_routes_to_harmonic() {
-        let d = TxDispacher::builder(Arc::new(MockOracle { harmonic: true, name: None })).build();
+        let d = TxDispacher::builder(Arc::new(MockOracle {
+            harmonic: true,
+            name: None,
+        }))
+        .build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
     }
 
     #[test]
     fn non_harmonic_client_type_routes_to_fallback() {
-        let d = TxDispacher::builder(Arc::new(MockOracle { harmonic: false, name: None })).build();
+        let d = TxDispacher::builder(Arc::new(MockOracle {
+            harmonic: false,
+            name: None,
+        }))
+        .build();
         assert_eq!(d.resolve_route(100), SendRoute::Fallback);
     }
 
@@ -255,8 +278,8 @@ mod tests {
     fn harmonic_in_name_routes_to_harmonic_even_if_type_is_other() {
         // client_type 是 Agave（Other），但 name 里有 harmonic 字样
         let oracle = MockOracle {
-            harmonic: false,                        // client_type = Agave
-            name: Some("Harmonic-SG"),              // name 含 harmonic
+            harmonic: false,           // client_type = Agave
+            name: Some("Harmonic-SG"), // name 含 harmonic
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
@@ -304,14 +327,14 @@ mod tests {
                 sol_tx_send::platform_clients::astralane::Astralane::init_with(
                     "ASTRALANE_API_KEY",
                     Region::Amsterdam,
-                )
+                ),
             )
             // feature = "temporal"
             .temporal(
                 sol_tx_send::platform_clients::temporal::Temporal::init_with(
                     "TEMPORAL_KEY",
                     Region::Amsterdam,
-                )
+                ),
             )
             // feature = "harmonic"（等文档确认协议后传真实 UUID）
             // .harmonic(HarmonicBlockEngine::init_with(Some("UUID"), Region::Amsterdam))
@@ -322,7 +345,7 @@ mod tests {
         let ctx = SendContext::new(
             payer.clone(),
             HashParam::Blockhash(Hash::default()), // 实际用 rpc.get_latest_blockhash().await
-            Arc::new(vec![]),                       // 无 ALT
+            Arc::new(vec![]),                      // 无 ALT
         );
         // 或者用 nonce：
         // let ctx = SendContext::from_nonce(payer, nonce_pubkey).await;
@@ -331,15 +354,17 @@ mod tests {
         let ixs = vec![]; // 填入实际指令
         let current_slot = 422_231_110u64;
 
-        let _sig = dispacher.send(
-            &ixs,
-            &ctx,
-            current_slot,
-            None,                           // tip_strategy: None → 各模式用内置默认
-            // Some(TipStrategy::Ratio(1.2)), // 或显式指定倍率
-            // Some(TipStrategy::Absolute(500_000)), // 或显式指定绝对值（lamports）
-            (Some(200_000), Some(50_000)),  // (cu_limit, cu_price_micro_lamports)
-            60,                             // confirm_timeout_secs
-        ).await;
+        let _sig = dispacher
+            .send(
+                &ixs,
+                &ctx,
+                current_slot,
+                None, // tip_strategy: None → 各模式用内置默认
+                // Some(TipStrategy::Ratio(1.2)), // 或显式指定倍率
+                // Some(TipStrategy::Absolute(500_000)), // 或显式指定绝对值（lamports）
+                (Some(200_000), Some(50_000)), // (cu_limit, cu_price_micro_lamports)
+                60,                            // confirm_timeout_secs
+            )
+            .await;
     }
 }

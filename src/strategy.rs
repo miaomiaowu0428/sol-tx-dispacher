@@ -4,12 +4,12 @@
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
 use crate::{SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
+use ahash::AHashSet as HashSet;
 use grpc_client::TransactionFormat;
-use sol_slot_leader::SlotOracle;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
+use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
-use ahash::AHashSet as HashSet;
 
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,
@@ -22,7 +22,7 @@ pub(crate) async fn dispatch<O: SlotOracle>(
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
-        SendRoute::Jito     => jito_mode(d, ixs, ctx, tip_strategy, timeout_secs).await,
+        SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, timeout_secs).await,
         SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
     result.map_err(|e| anyhow::anyhow!("send failed: {}", e))
@@ -39,7 +39,11 @@ fn opt_tip(strategy: Option<TipStrategy>, platform_min: u64) -> Option<u64> {
 
 /// 带默认比例的 tip 计算：`None` 时用 `default_ratio × platform_min`。
 #[inline]
-fn tip_or_default(strategy: Option<TipStrategy>, platform_min: u64, default_ratio: f64) -> Option<u64> {
+fn tip_or_default(
+    strategy: Option<TipStrategy>,
+    platform_min: u64,
+    default_ratio: f64,
+) -> Option<u64> {
     Some(match strategy {
         Some(s) => s.compute(platform_min),
         None => (platform_min as f64 * default_ratio) as u64,
@@ -68,7 +72,17 @@ async fn harmonic_mode<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = opt_tip($tip, min);
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
@@ -92,9 +106,26 @@ async fn harmonic_mode<O: SlotOracle>(
         // 取 MAX：tip 转换值 vs 调用方原始 cu_price
         // Harmonic revert protection 保证失败不付钱，取高的竞价更有力且无额外风险
         let harmonic_cu_price = tip_derived_cu_price.max(cu.1.unwrap_or(0));
-        let harmonic_cu = (cu.0, if harmonic_cu_price > 0 { Some(harmonic_cu_price) } else { None });
+        let harmonic_cu = (
+            cu.0,
+            if harmonic_cu_price > 0 {
+                Some(harmonic_cu_price)
+            } else {
+                None
+            },
+        );
         // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
-        fire_client(c, ixs, &ctx.payer, None, &ctx.hash_param, &harmonic_cu, &ctx.alt, None, &mut sigs);
+        fire_client(
+            c,
+            ixs,
+            &ctx.payer,
+            None,
+            &ctx.hash_param,
+            &harmonic_cu,
+            &ctx.alt,
+            None,
+            &mut sigs,
+        );
     }
 
     // AstralaneQuic / Temporal：tip_strategy × 0.9，不带 cu_price
@@ -165,20 +196,35 @@ async fn jito_mode<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = opt_tip(tip_strategy, min);
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
 
     // 只发带 tip 的版本：fire_both 平台取 no_price 那笔，fire_with_price 平台跳过
-    #[cfg(feature = "astralane_quic")]  fire_tip_only!(d.astralane_quic);
+    #[cfg(feature = "astralane_quic")]
+    fire_tip_only!(d.astralane_quic);
     #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
     fire_tip_only!(d.astralane);
 
-    #[cfg(feature = "flash_block")]     fire_tip_only!(d.flash_block);
-    #[cfg(feature = "temporal")]        fire_tip_only!(d.temporal);
-    #[cfg(feature = "zeroslot")]        fire_tip_only!(d.zeroslot);
-    #[cfg(feature = "jito")]            fire_tip_only!(d.jito);
+    #[cfg(feature = "flash_block")]
+    fire_tip_only!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    fire_tip_only!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    fire_tip_only!(d.zeroslot);
+    #[cfg(feature = "jito")]
+    fire_tip_only!(d.jito);
 
     // everstake_quic / everstake / nodeone / blockrazor / helius / nextblock / stellium
     // 这些平台在 fallback 里只发 cu_price 版本，Jito 模式下跳过
@@ -223,7 +269,17 @@ async fn fallback_mode<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = opt_tip($tip, min);
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
@@ -234,8 +290,28 @@ async fn fallback_mode<O: SlotOracle>(
                 let min = c.as_ref().get_min_tip_amount();
                 let t1 = opt_tip($tip1, min);
                 let t2 = opt_tip($tip2, min);
-                fire_client(c, ixs, &ctx.payer, t1, &ctx.hash_param, &cu,          &ctx.alt, None, &mut sigs);
-                fire_client(c, ixs, &ctx.payer, t2, &ctx.hash_param, &cu_no_price, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t1,
+                    &ctx.hash_param,
+                    &cu,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t2,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
@@ -245,7 +321,17 @@ async fn fallback_mode<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = opt_tip($tip, min);
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
@@ -286,8 +372,6 @@ async fn fallback_mode<O: SlotOracle>(
         with_price: Some(TipStrategy::Ratio(1.05)),
         no_price:   tip_strategy,
     );
-
-
 
     #[cfg(feature = "nodeone")]
     fire_with_price!(d.nodeone, tip: Some(TipStrategy::Ratio(1.05)));
@@ -346,7 +430,17 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = opt_tip(tip_strategy, min);
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu,
+                    &ctx.alt,
+                    None,
+                    &mut sigs,
+                );
             }
         };
     }
@@ -363,9 +457,11 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     fire_cheap!(d.astralane);
 
     // 少数 HTTP 平台
-    #[cfg(feature = "flash_block")]     fire_cheap!(d.flash_block);
+    #[cfg(feature = "flash_block")]
+    fire_cheap!(d.flash_block);
     // Jito（靠 tip 排序，便宜但有效）
-    #[cfg(feature = "jito")]            fire_cheap!(d.jito);
+    #[cfg(feature = "jito")]
+    fire_cheap!(d.jito);
 
     log::info!("[dispatch_cheap] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)

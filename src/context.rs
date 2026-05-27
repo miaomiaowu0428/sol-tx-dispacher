@@ -1,7 +1,9 @@
 //! SendContext — 发送所需的账户 / hash 上下文，与 trade-solana-impl 的 TxSenderContext 平行。
 
 use sol_tx_send::platform_clients::HashParam;
-use solana_sdk::{message::AddressLookupTableAccount, pubkey::Pubkey, signature::Keypair, signer::Signer};
+use solana_sdk::{
+    message::AddressLookupTableAccount, pubkey::Pubkey, signature::Keypair, signer::Signer,
+};
 use std::sync::Arc;
 
 /// 发送上下文：payer、hash（nonce / blockhash）、ALT。
@@ -19,7 +21,11 @@ impl SendContext {
         hash_param: HashParam,
         alt: Arc<Vec<AddressLookupTableAccount>>,
     ) -> Self {
-        Self { payer, hash_param, alt }
+        Self {
+            payer,
+            hash_param,
+            alt,
+        }
     }
 
     /// 使用 nonce 账户构建，自动查询最新 hash。

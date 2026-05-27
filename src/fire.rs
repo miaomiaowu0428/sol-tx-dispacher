@@ -4,6 +4,7 @@
 //! block 结束时 TxEnvelope 被 drop（借用释放），再 Arc::clone 用于 spawn。
 //! 这样避免了 TxEnvelope<'a, C> 的 'a 生命周期跨 spawn 边界问题。
 
+use ahash::AHashSet as HashSet;
 use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, HashParam, SendTxEncoded};
 use solana_sdk::{
     instruction::Instruction,
@@ -11,8 +12,7 @@ use solana_sdk::{
     signature::{Keypair, Signature},
     signer::Signer,
 };
-use ahash::AHashSet as HashSet;
-use std::{ fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
 /// 对某个平台发起一次 fire-and-forget 发送，将 sig 插入 `sigs`。
 ///
