@@ -11,7 +11,8 @@ use solana_sdk::{
     signature::{Keypair, Signature},
     signer::Signer,
 };
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use ahash::AHashSet as HashSet;
+use std::{ fmt::Display, sync::Arc};
 
 /// 对某个平台发起一次 fire-and-forget 发送，将 sig 插入 `sigs`。
 ///

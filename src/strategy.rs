@@ -9,7 +9,7 @@ use sol_slot_leader::SlotOracle;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
-use std::collections::HashSet;
+use ahash::AHashSet as HashSet;
 
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,

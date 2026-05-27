@@ -59,5 +59,6 @@ grpc-client     = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
 tokio           = { version = "1", features = ["full"] }
 log             = "0.4"
 anyhow          = "1"
+ahash           = "0.8"
 solana-sdk      = "3.0.0"
 solana-client   = "3.1.11"
