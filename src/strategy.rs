@@ -195,7 +195,8 @@ async fn jito_mode<O: SlotOracle>(
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
-    let cu_no_price = (None, None); // 不带 cu_limit 也不带 cu_price
+    // Jito 模式：只带 tip，不带 cu_price，cu_limit 固定 150000
+    let cu_no_price = (Some(150_000u32), None);
 
     macro_rules! fire_tip_only {
         ($client_opt:expr $(,)?) => {
