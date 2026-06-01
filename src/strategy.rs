@@ -10,6 +10,12 @@ use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
+use std::sync::LazyLock;
+
+/// 通用 memo 标签，来源于环境变量 MEMO_TAG，默认 "default"
+pub static MEMO_TAG: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string())
+});
 
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,
@@ -80,7 +86,7 @@ async fn harmonic_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu_no_price,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
@@ -123,7 +129,7 @@ async fn harmonic_mode<O: SlotOracle>(
             &ctx.hash_param,
             &harmonic_cu,
             &ctx.alt,
-            None,
+            Some(&*MEMO_TAG),
             &mut sigs,
         );
     }
@@ -204,7 +210,7 @@ async fn jito_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu_no_price,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
@@ -277,7 +283,7 @@ async fn fallback_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
@@ -298,7 +304,7 @@ async fn fallback_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
                 fire_client(
@@ -309,7 +315,7 @@ async fn fallback_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu_no_price,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
@@ -329,7 +335,7 @@ async fn fallback_mode<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu_no_price,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
@@ -438,7 +444,7 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
                     &ctx.hash_param,
                     &cu,
                     &ctx.alt,
-                    None,
+                    Some(&*MEMO_TAG),
                     &mut sigs,
                 );
             }
