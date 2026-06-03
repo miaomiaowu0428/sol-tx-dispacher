@@ -28,7 +28,7 @@ pub(crate) async fn dispatch<O: SlotOracle>(
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
-        SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, timeout_secs).await,
+        SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
     result.map_err(|e| anyhow::anyhow!("send failed: {}", e))
@@ -191,12 +191,13 @@ async fn jito_mode<O: SlotOracle>(
     ixs: &[Instruction],
     ctx: &SendContext,
     tip_strategy: Option<TipStrategy>,
+    cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
-    // Jito 模式：只带 tip，不带 cu_price，cu_limit 固定 150000
-    let cu_no_price = (Some(150_000u32), None);
+    // Jito 模式：只带 tip，不带 cu_price，cu_limit 从调用方透传
+    let cu_no_price = (cu.0, None);
 
     macro_rules! fire_tip_only {
         ($client_opt:expr $(,)?) => {
