@@ -31,28 +31,32 @@ pub(crate) async fn dispatch<O: SlotOracle>(
         SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
-    result.map_err(|e| anyhow::anyhow!("send failed: {}", e))
+    result.map_err(|e| anyhow::Error::from(e).context("send failed"))
 }
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
-/// `Option<TipStrategy>` → `Option<u64>`：
-/// `None` 直接返回 `None`，让 `fire_client` 内部走平台 `get_min_tip_amount()`。
+/// `Option<TipStrategy>` → `Option<u64>`。
+/// `None` 掉头返回 `None`，让 `fire_client` 走平台默认。
+/// `Some` 时取 `max(strategy_output, platform_min × 1.02)`，保证至少比最低价高 2%。
 #[inline]
 fn opt_tip(strategy: Option<TipStrategy>, platform_min: u64) -> Option<u64> {
-    strategy.map(|s| s.compute(platform_min))
+    let floor = (platform_min as f64 * 1.02) as u64;
+    strategy.map(|s| s.compute(platform_min).max(floor))
 }
 
 /// 带默认比例的 tip 计算：`None` 时用 `default_ratio × platform_min`。
+/// 最终值同样不低于 `platform_min × 1.02`。
 #[inline]
 fn tip_or_default(
     strategy: Option<TipStrategy>,
     platform_min: u64,
     default_ratio: f64,
 ) -> Option<u64> {
+    let floor = (platform_min as f64 * 1.02) as u64;
     Some(match strategy {
-        Some(s) => s.compute(platform_min),
-        None => (platform_min as f64 * default_ratio) as u64,
+        Some(s) => s.compute(platform_min).max(floor),
+        None => ((platform_min as f64 * default_ratio) as u64).max(floor),
     })
 }
 
