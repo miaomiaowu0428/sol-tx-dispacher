@@ -480,3 +480,169 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
         .await
         .map_err(|e| anyhow::anyhow!("send_cheap failed: {}", e))
 }
+
+// ── dispatch_tip_only ────────────────────────────────────────────────────────
+
+/// 纯 tip 竞价：不参与 cu_price 竞争，全平台一发，tip 至少 `min_tip_floor`。
+pub(crate) async fn dispatch_tip_only<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    route: SendRoute,
+    min_tip_floor: u64,
+    cu_limit: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let result = match route {
+        SendRoute::Harmonic => {
+            tip_only_harmonic(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
+        }
+        SendRoute::Jito => {
+            tip_only_jito(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
+        }
+        SendRoute::Fallback => {
+            tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
+        }
+    };
+    result.map_err(|e| anyhow::Error::from(e).context("send_tip_only failed"))
+}
+
+// ── 三种 tip-only 子策略 ───────────────────────────────────────────────────
+
+/// 辅助宏：全平台 fire（harmonic 和 jito-only 之外的所有平台）
+macro_rules! fire_all_tip_platforms {
+    ($d:expr, $fire:ident) => {
+        #[cfg(feature = "everstake_quic")]
+        $fire!($d.everstake_quic);
+        #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+        $fire!($d.everstake);
+        #[cfg(feature = "astralane_quic")]
+        $fire!($d.astralane_quic);
+        #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+        $fire!($d.astralane);
+        #[cfg(feature = "flash_block")]
+        $fire!($d.flash_block);
+        #[cfg(feature = "temporal")]
+        $fire!($d.temporal);
+        #[cfg(feature = "zeroslot")]
+        $fire!($d.zeroslot);
+        #[cfg(feature = "nodeone")]
+        $fire!($d.nodeone);
+        #[cfg(feature = "blockrazor")]
+        $fire!($d.blockrazor);
+        #[cfg(feature = "helius")]
+        $fire!($d.helius);
+        #[cfg(feature = "nextblock")]
+        $fire!($d.nextblock);
+        #[cfg(feature = "stellium")]
+        $fire!($d.stellium);
+    };
+}
+
+/// Harmonic 出块：发 Harmonic + 全平台 tip-only（不加 cu_price）。
+/// Harmonic 的 tip 会被内部转为 cu_price 竞价。
+async fn tip_only_harmonic<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    cu_limit: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cu_no_price = (Some(cu_limit), None);
+
+    // tip 至少 min_tip_floor，平台 min 也取大
+    macro_rules! fire_tip {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = Some(min_tip_floor.max(min));
+                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    // Harmonic: tip → cu_price 转换（Harmonic 竞价 = priority fee）
+    #[cfg(feature = "harmonic")]
+    if let Some(c) = &d.harmonic {
+        let cu = cu_limit as u64;
+        let cu_price = if cu > 0 { min_tip_floor.saturating_mul(1_000_000) / cu } else { 0 };
+        let harmonic_cu = (Some(cu_limit), if cu_price > 0 { Some(cu_price) } else { None });
+        fire_client(c, ixs, &ctx.payer, None, &ctx.hash_param, &harmonic_cu, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+    }
+
+    fire_all_tip_platforms!(d, fire_tip);
+    log::info!("[tip_only_harmonic] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(harmonic) failed: {}", e))
+}
+
+/// Jito 出块：只发 tip-capable 平台（Jito/QUIC/FlashBlock 等）。
+async fn tip_only_jito<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    cu_limit: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cu_no_price = (Some(cu_limit), None);
+
+    macro_rules! fire_tip {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = Some(min_tip_floor.max(min));
+                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    // Jito 模式：只发 tip-capable 平台
+    #[cfg(feature = "astralane_quic")]
+    fire_tip!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_tip!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    fire_tip!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    fire_tip!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    fire_tip!(d.zeroslot);
+    #[cfg(feature = "jito")]
+    fire_tip!(d.jito);
+
+    log::info!("[tip_only_jito] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(jito) failed: {}", e))
+}
+
+/// Fallback：全平台 tip-only 一发。
+async fn tip_only_fallback<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    cu_limit: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cu_no_price = (Some(cu_limit), None);
+
+    macro_rules! fire_tip {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = Some(min_tip_floor.max(min));
+                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    fire_all_tip_platforms!(d, fire_tip);
+    log::info!("[tip_only_fallback] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(fallback) failed: {}", e))
+}

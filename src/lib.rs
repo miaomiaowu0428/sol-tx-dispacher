@@ -215,6 +215,28 @@ impl<O: SlotOracle> TxDispacher<O> {
     )> {
         strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
     }
+
+    /// 纯 tip 竞价发送——不参与 cu_price 竞争，只靠 SOL tip 抢排序。
+    ///
+    /// tip 至少为 `min_tip_floor`（lamports），平台 min_tip 也取其大者。
+    /// 路由逻辑与 `send()` 一致：Harmonic 出块走 Harmonic，Jito 出块只发 tip，
+    /// 其余全平台一发。适合高价值 snipe：tip 给够，不浪费 cu_price 费用。
+    pub async fn send_tip_only(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        min_tip_floor: u64,
+        cu_limit: u32,
+        confirm_timeout_secs: u64,
+    ) -> anyhow::Result<(
+        solana_sdk::signature::Signature,
+        grpc_client::TransactionFormat,
+    )> {
+        let route = self.resolve_route(target_slot);
+        log::info!("[TxDispacher::send_tip_only] slot={} route={:?} tip_floor={}", target_slot, route, min_tip_floor);
+        strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs).await
+    }
 }
 
 #[cfg(test)]
