@@ -13,9 +13,8 @@ use solana_sdk::{instruction::Instruction, signature::Signature};
 use std::sync::LazyLock;
 
 /// 通用 memo 标签，来源于环境变量 MEMO_TAG，默认 "default"
-pub static MEMO_TAG: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string())
-});
+pub static MEMO_TAG: LazyLock<String> =
+    LazyLock::new(|| std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string()));
 
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,
@@ -497,9 +496,7 @@ pub(crate) async fn dispatch_tip_only<O: SlotOracle>(
         SendRoute::Harmonic => {
             tip_only_harmonic(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
         }
-        SendRoute::Jito => {
-            tip_only_jito(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
-        }
+        SendRoute::Jito => tip_only_jito(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
         SendRoute::Fallback => {
             tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
         }
@@ -559,7 +556,17 @@ async fn tip_only_harmonic<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = Some(min_tip_floor.max(min));
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
             }
         };
     }
@@ -568,14 +575,33 @@ async fn tip_only_harmonic<O: SlotOracle>(
     #[cfg(feature = "harmonic")]
     if let Some(c) = &d.harmonic {
         let cu = cu_limit as u64;
-        let cu_price = if cu > 0 { min_tip_floor.saturating_mul(1_000_000) / cu } else { 0 };
-        let harmonic_cu = (Some(cu_limit), if cu_price > 0 { Some(cu_price) } else { None });
-        fire_client(c, ixs, &ctx.payer, None, &ctx.hash_param, &harmonic_cu, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+        let cu_price = if cu > 0 {
+            min_tip_floor.saturating_mul(1_000_000) / cu
+        } else {
+            0
+        };
+        let harmonic_cu = (
+            Some(cu_limit),
+            if cu_price > 0 { Some(cu_price) } else { None },
+        );
+        fire_client(
+            c,
+            ixs,
+            &ctx.payer,
+            None,
+            &ctx.hash_param,
+            &harmonic_cu,
+            &ctx.alt,
+            Some(&*MEMO_TAG),
+            &mut sigs,
+        );
     }
 
     fire_all_tip_platforms!(d, fire_tip);
     log::info!("[tip_only_harmonic] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(harmonic) failed: {}", e))
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only(harmonic) failed: {}", e))
 }
 
 /// Jito 出块：只发 tip-capable 平台（Jito/QUIC/FlashBlock 等）。
@@ -596,7 +622,17 @@ async fn tip_only_jito<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = Some(min_tip_floor.max(min));
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
             }
         };
     }
@@ -616,7 +652,9 @@ async fn tip_only_jito<O: SlotOracle>(
     fire_tip!(d.jito);
 
     log::info!("[tip_only_jito] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(jito) failed: {}", e))
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only(jito) failed: {}", e))
 }
 
 /// Fallback：全平台 tip-only 一发。
@@ -637,12 +675,24 @@ async fn tip_only_fallback<O: SlotOracle>(
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
                 let tip = Some(min_tip_floor.max(min));
-                fire_client(c, ixs, &ctx.payer, tip, &ctx.hash_param, &cu_no_price, &ctx.alt, Some(&*MEMO_TAG), &mut sigs);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
             }
         };
     }
 
     fire_all_tip_platforms!(d, fire_tip);
     log::info!("[tip_only_fallback] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs).await.map_err(|e| anyhow::anyhow!("send_tip_only(fallback) failed: {}", e))
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only(fallback) failed: {}", e))
 }

@@ -234,8 +234,22 @@ impl<O: SlotOracle> TxDispacher<O> {
         grpc_client::TransactionFormat,
     )> {
         let route = self.resolve_route(target_slot);
-        log::info!("[TxDispacher::send_tip_only] slot={} route={:?} tip_floor={}", target_slot, route, min_tip_floor);
-        strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs).await
+        log::info!(
+            "[TxDispacher::send_tip_only] slot={} route={:?} tip_floor={}",
+            target_slot,
+            route,
+            min_tip_floor
+        );
+        strategy::dispatch_tip_only(
+            self,
+            ixs,
+            ctx,
+            route,
+            min_tip_floor,
+            cu_limit,
+            confirm_timeout_secs,
+        )
+        .await
     }
 }
 
