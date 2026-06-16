@@ -10,7 +10,7 @@ use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Arc, Mutex};
 
 /// 通用 memo 标签，来源于环境变量 MEMO_TAG，默认 "default"
 pub static MEMO_TAG: LazyLock<String> =
@@ -504,9 +504,81 @@ pub(crate) async fn dispatch_tip_only<O: SlotOracle>(
     result.map_err(|e| anyhow::Error::from(e).context("send_tip_only failed"))
 }
 
-// ── 三种 tip-only 子策略 ───────────────────────────────────────────────────
+/// 并行版 fire_all_tip_platforms：所有平台并发 build+sign+send。
+/// 总延迟 = max(单个平台 build 时间) 而非 sum。
+async fn fire_all_parallel(
+    d: &TxDispacher<impl SlotOracle>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    cu_limit: u32,
+    memo: Option<String>,
+    sigs: &mut HashSet<Signature>,
+) {
+    use std::sync::Mutex;
+    use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, SendTxEncoded};
 
-/// 辅助宏：全平台 fire（harmonic 和 jito-only 之外的所有平台）
+    let sigs_shared = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    let cu = (Some(cu_limit), None);
+
+    macro_rules! spawn_fire {
+        ($client_opt:expr) => {
+            if let Some(c) = &$client_opt {
+                let c = Arc::clone(c);
+                let ixs = ixs.to_vec();
+                let payer = ctx.payer.clone();
+                let tip = Some(min_tip_floor.max(c.get_min_tip_amount()));
+                let hash_param = ctx.hash_param.clone();
+                let cu = cu;
+                let alt = ctx.alt.clone();
+                let memo = memo.clone();
+                let sigs = sigs_shared.clone();
+                handles.push(tokio::spawn(async move {
+                    let memo_ref: Option<&str> = memo.as_deref();
+                    let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
+                    match c.build_v0_tx(&ixs, &payer, &tip, &hash_param, &cu, &alt, memo_vec) {
+                        Ok(env) => {
+                            let sig = env.sig();
+                            let b64 = match env.inner_tx().to_base64() {
+                                Ok(b) => b,
+                                Err(e) => { log::error!("[par] {} serialize: {}", c, e); return; }
+                            };
+                            log::info!("[par] 🚀 {} sending {}", c, sig);
+                            sigs.lock().unwrap().push(sig);
+                            let sender = Arc::clone(&c);
+                            tokio::spawn(async move { let _ = sender.send_tx_encoded(&b64).await; });
+                        }
+                        Err(e) => { log::error!("[par] {} build: {}", c, e); }
+                    }
+                }));
+            }
+        };
+    }
+
+    #[cfg(feature = "everstake_quic")] spawn_fire!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))] spawn_fire!(d.everstake);
+    #[cfg(feature = "astralane_quic")] spawn_fire!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))] spawn_fire!(d.astralane);
+    #[cfg(feature = "flash_block")] spawn_fire!(d.flash_block);
+    #[cfg(feature = "temporal")] spawn_fire!(d.temporal);
+    #[cfg(feature = "zeroslot")] spawn_fire!(d.zeroslot);
+    #[cfg(feature = "nodeone")] spawn_fire!(d.nodeone);
+    #[cfg(feature = "blockrazor")] spawn_fire!(d.blockrazor);
+    #[cfg(feature = "helius")] spawn_fire!(d.helius);
+    #[cfg(feature = "nextblock")] spawn_fire!(d.nextblock);
+    #[cfg(feature = "stellium")] spawn_fire!(d.stellium);
+
+    for h in handles {
+        let _ = h.await;
+    }
+    for sig in sigs_shared.lock().unwrap().iter() {
+        sigs.insert(*sig);
+    }
+}
+
+// ── 辅助宏：全平台 fire（harmonic 和 jito-only 之外的所有平台） ───────────
+
 macro_rules! fire_all_tip_platforms {
     ($d:expr, $fire:ident) => {
         #[cfg(feature = "everstake_quic")]
@@ -548,28 +620,6 @@ async fn tip_only_harmonic<O: SlotOracle>(
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
-    let cu_no_price = (Some(cu_limit), None);
-
-    // tip 至少 min_tip_floor，平台 min 也取大
-    macro_rules! fire_tip {
-        ($client_opt:expr $(,)?) => {
-            if let Some(c) = &$client_opt {
-                let min = c.as_ref().get_min_tip_amount();
-                let tip = Some(min_tip_floor.max(min));
-                fire_client(
-                    c,
-                    ixs,
-                    &ctx.payer,
-                    tip,
-                    &ctx.hash_param,
-                    &cu_no_price,
-                    &ctx.alt,
-                    Some(&*MEMO_TAG),
-                    &mut sigs,
-                );
-            }
-        };
-    }
 
     // Harmonic: tip → cu_price 转换（Harmonic 竞价 = priority fee）
     #[cfg(feature = "harmonic")]
@@ -597,7 +647,7 @@ async fn tip_only_harmonic<O: SlotOracle>(
         );
     }
 
-    fire_all_tip_platforms!(d, fire_tip);
+    fire_all_parallel(d, ixs, ctx, min_tip_floor, cu_limit, Some(MEMO_TAG.to_string()), &mut sigs).await;
     log::info!("[tip_only_harmonic] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
@@ -668,29 +718,8 @@ async fn tip_only_fallback<O: SlotOracle>(
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
-    let cu_no_price = (Some(cu_limit), None);
 
-    macro_rules! fire_tip {
-        ($client_opt:expr $(,)?) => {
-            if let Some(c) = &$client_opt {
-                let min = c.as_ref().get_min_tip_amount();
-                let tip = Some(min_tip_floor.max(min));
-                fire_client(
-                    c,
-                    ixs,
-                    &ctx.payer,
-                    tip,
-                    &ctx.hash_param,
-                    &cu_no_price,
-                    &ctx.alt,
-                    Some(&*MEMO_TAG),
-                    &mut sigs,
-                );
-            }
-        };
-    }
-
-    fire_all_tip_platforms!(d, fire_tip);
+    fire_all_parallel(d, ixs, ctx, min_tip_floor, cu_limit, Some(MEMO_TAG.to_string()), &mut sigs).await;
     log::info!("[tip_only_fallback] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
