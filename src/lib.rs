@@ -29,6 +29,7 @@ pub use builder::TxDispacherBuilder;
 pub use context::SendContext;
 
 use sol_slot_leader::SlotOracle;
+use nonce_cache::TxConfirmError;
 use std::sync::Arc;
 
 // ── TipStrategy ───────────────────────────────────────────────────────────────
@@ -145,6 +146,12 @@ pub struct TxDispacher<O: SlotOracle> {
     pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
 
+/// 将 anyhow::Error 转为 TxConfirmError（downcast 根因，downcast 不出当 Other）
+fn into_tx_confirm_err(e: anyhow::Error) -> TxConfirmError {
+    e.downcast::<TxConfirmError>()
+        .unwrap_or_else(|e| TxConfirmError::Other(format!("{:#}", e)))
+}
+
 impl<O: SlotOracle> TxDispacher<O> {
     /// 返回 builder。
     pub fn builder(oracle: O) -> TxDispacherBuilder<O> {
@@ -180,10 +187,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<(
-        solana_sdk::signature::Signature,
-        grpc_client::TransactionFormat,
-    )> {
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
         strategy::dispatch(
@@ -196,6 +200,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             confirm_timeout_secs,
         )
         .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
@@ -209,11 +214,9 @@ impl<O: SlotOracle> TxDispacher<O> {
         tip_strategy: Option<TipStrategy>,
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<(
-        solana_sdk::signature::Signature,
-        grpc_client::TransactionFormat,
-    )> {
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
+            .map_err(into_tx_confirm_err)
     }
 
     /// 纯 tip 竞价发送——不参与 cu_price 竞争，只靠 SOL tip 抢排序。
@@ -229,10 +232,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         min_tip_floor: u64,
         cu_limit: u32,
         confirm_timeout_secs: u64,
-    ) -> anyhow::Result<(
-        solana_sdk::signature::Signature,
-        grpc_client::TransactionFormat,
-    )> {
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
         log::info!(
             "[TxDispacher::send_tip_only] slot={} route={:?} tip_floor={}",
@@ -250,6 +250,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             confirm_timeout_secs,
         )
         .await
+        .map_err(into_tx_confirm_err)
     }
 }
 
