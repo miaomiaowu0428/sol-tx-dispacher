@@ -39,6 +39,11 @@ const TIP_ONLY_LEADERS: &[solana_sdk::pubkey::Pubkey] = &[
     solana_sdk::pubkey!("Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk"),
     solana_sdk::pubkey!("5pPRHniefFjkiaArbGX3Y8NUysJmQ9tMZg3FrFGwHzSm"),
     solana_sdk::pubkey!("ACvL73V4GNnxPVfZ7K89jCrYurLyzpEuE9qirjvh2Xmi"),
+    solana_sdk::pubkey!("8tjFeSApQ85ThoQXT28acfF2KUfQr3TvTdirSkzNnYC7"),
+    solana_sdk::pubkey!("HH5dA42XF1HxNk1TRpG6LuKfLViMYNdAz5iWrFM4hWFi"),
+    solana_sdk::pubkey!("Gv9gguvrAkgQtB5g5a3Un7trcHCxLYsk8vSojLmQMsWV"),
+    solana_sdk::pubkey!("H8fHToVcZPi5bupGZohGPX2SWs8NHzgFKQ31wi5n6oux"),
+    solana_sdk::pubkey!("ChorusmmK7i1AxXeiTtQgQZhQNiXYU84ULeaYF1EH15n"),
 ];
 
 // ── TipStrategy ───────────────────────────────────────────────────────────────
