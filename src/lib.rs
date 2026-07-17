@@ -28,9 +28,18 @@ mod strategy;
 pub use builder::TxDispacherBuilder;
 pub use context::SendContext;
 
-use sol_slot_leader::SlotOracle;
 use nonce_cache::TxConfirmError;
+use sol_slot_leader::SlotOracle;
 use std::sync::Arc;
+
+/// 走 tip-only 模式的 leader vote account（只靠 tip 竞价，不参与 cu_price 竞争）
+const TIP_ONLY_LEADERS: &[solana_sdk::pubkey::Pubkey] = &[
+    solana_sdk::pubkey!("HEL1USMZKAL2odpNBj2oCjffnFGaYwmbGmyewGv1e2TU"),
+    solana_sdk::pubkey!("E1r4Psq84tHfQ6aPTvvDka4U3u8zPVD7gEUrH25RdxHL"),
+    solana_sdk::pubkey!("Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk"),
+    solana_sdk::pubkey!("5pPRHniefFjkiaArbGX3Y8NUysJmQ9tMZg3FrFGwHzSm"),
+    solana_sdk::pubkey!("ACvL73V4GNnxPVfZ7K89jCrYurLyzpEuE9qirjvh2Xmi"),
+];
 
 // ── TipStrategy ───────────────────────────────────────────────────────────────
 
@@ -104,6 +113,8 @@ pub enum SendRoute {
     Harmonic,
     /// Jito 节点出块：只发带 tip 的版本，跳过纯 cu_price 的交易
     Jito,
+    /// Tip-only 模式：只发 tip 竞价（不发 cu_price），全平台一发
+    TipOnly,
     /// 其他所有节点（含 DB 无记录 / NoopOracle）：退化到 send_fast
     Fallback,
 }
@@ -162,7 +173,17 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// 查询 `target_slot` 的 leader 类型并返回路由决策。
     /// 调用方自行决定传当前 slot 还是 current_slot + N。
     pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
-        match self.oracle.leader_at(target_slot) {
+        let info = self.oracle.leader_at(target_slot);
+        // 1. 先按具体 leader pubkey 匹配 tip-only 白名单
+        if let Some(ref info) = info {
+            if let Some(pk) = info.leader_pubkey() {
+                if TIP_ONLY_LEADERS.contains(pk) {
+                    return SendRoute::TipOnly;
+                }
+            }
+        }
+        // 2. 再按客户端类型匹配
+        match info {
             Some(info) if info.is_harmonic() => SendRoute::Harmonic,
             Some(info) if info.is_jito() => SendRoute::Jito,
             _ => SendRoute::Fallback,
@@ -190,17 +211,9 @@ impl<O: SlotOracle> TxDispacher<O> {
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
-        strategy::dispatch(
-            self,
-            ixs,
-            ctx,
-            route,
-            tip_strategy,
-            cu,
-            confirm_timeout_secs,
-        )
-        .await
-        .map_err(into_tx_confirm_err)
+        strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
     }
 
     /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
@@ -215,7 +228,8 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs).await
+        strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs)
+            .await
             .map_err(into_tx_confirm_err)
     }
 
@@ -240,17 +254,9 @@ impl<O: SlotOracle> TxDispacher<O> {
             route,
             min_tip_floor
         );
-        strategy::dispatch_tip_only(
-            self,
-            ixs,
-            ctx,
-            route,
-            min_tip_floor,
-            cu_limit,
-            confirm_timeout_secs,
-        )
-        .await
-        .map_err(into_tx_confirm_err)
+        strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
     }
 }
 
@@ -360,19 +366,15 @@ mod tests {
         // ── 2. 构造 Dispacher，链式注入各平台 ──────────────────────────────
         let dispacher = TxDispacher::builder(oracle)
             // feature = "astralane"
-            .astralane(
-                sol_tx_send::platform_clients::astralane::Astralane::init_with(
-                    "ASTRALANE_API_KEY",
-                    Region::Amsterdam,
-                ),
-            )
+            .astralane(sol_tx_send::platform_clients::astralane::Astralane::init_with(
+                "ASTRALANE_API_KEY",
+                Region::Amsterdam,
+            ))
             // feature = "temporal"
-            .temporal(
-                sol_tx_send::platform_clients::temporal::Temporal::init_with(
-                    "TEMPORAL_KEY",
-                    Region::Amsterdam,
-                ),
-            )
+            .temporal(sol_tx_send::platform_clients::temporal::Temporal::init_with(
+                "TEMPORAL_KEY",
+                Region::Amsterdam,
+            ))
             // feature = "harmonic"（等文档确认协议后传真实 UUID）
             // .harmonic(HarmonicBlockEngine::init_with(Some("UUID"), Region::Amsterdam))
             .build();

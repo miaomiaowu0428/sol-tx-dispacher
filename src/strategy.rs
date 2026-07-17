@@ -10,11 +10,10 @@ use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::BuildTx;
 use solana_sdk::{instruction::Instruction, signature::Signature};
-use std::sync::{LazyLock, Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// 通用 memo 标签，来源于环境变量 MEMO_TAG，默认 "default"
-pub static MEMO_TAG: LazyLock<String> =
-    LazyLock::new(|| std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string()));
+pub static MEMO_TAG: LazyLock<String> = LazyLock::new(|| std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string()));
 
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,
@@ -29,6 +28,7 @@ pub(crate) async fn dispatch<O: SlotOracle>(
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
+        SendRoute::TipOnly => tip_only_auto(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send failed"))
 }
@@ -47,11 +47,7 @@ fn opt_tip(strategy: Option<TipStrategy>, platform_min: u64) -> Option<u64> {
 /// 带默认比例的 tip 计算：`None` 时用 `default_ratio × platform_min`。
 /// 最终值同样不低于 `platform_min × 1.02`。
 #[inline]
-fn tip_or_default(
-    strategy: Option<TipStrategy>,
-    platform_min: u64,
-    default_ratio: f64,
-) -> Option<u64> {
+fn tip_or_default(strategy: Option<TipStrategy>, platform_min: u64, default_ratio: f64) -> Option<u64> {
     let floor = (platform_min as f64 * 1.02) as u64;
     Some(match strategy {
         Some(s) => s.compute(platform_min).max(floor),
@@ -480,6 +476,63 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
         .map_err(|e| anyhow::anyhow!("send_cheap failed: {}", e))
 }
 
+// ── tip_only_auto ────────────────────────────────────────────────────────
+
+/// Tip-only 自动模式：cu_price 由 cu_limit 反推，总价不超过 0.0001 SOL。
+async fn tip_only_auto<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    cu: (Option<u32>, Option<u64>),
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    // cu_price 自动调整：总价 = cu_price × cu_limit / 1_000_000 ≤ 0.0001 SOL = 100_000 lamports
+    let cu_limit = cu.0.unwrap_or(200_000);
+    let max_price = 100_000u64.saturating_mul(1_000_000) / cu_limit as u64;
+    let cu_price = (max_price as f64 * 0.8) as u64; // 留 20% 余量
+
+    // 用 tip_strategy 或 5000 lamports 作为最低 tip
+    let min_tip_floor = tip_strategy.map(|s| s.compute(0)).unwrap_or(5_000);
+
+    // Helius 先发
+    #[cfg(feature = "helius")]
+    if let Some(c) = &d.helius {
+        let tip = Some(min_tip_floor.max(c.as_ref().get_min_tip_amount()));
+        fire_client(
+            c,
+            ixs,
+            &ctx.payer,
+            tip,
+            &ctx.hash_param,
+            &(Some(cu_limit), Some(cu_price)),
+            &ctx.alt,
+            Some(&*MEMO_TAG),
+            &mut sigs,
+        );
+    }
+
+    fire_all_parallel(
+        d,
+        ixs,
+        ctx,
+        min_tip_floor,
+        cu_limit,
+        Some(cu_price),
+        Some(MEMO_TAG.to_string()),
+        &mut sigs,
+    )
+    .await;
+    log::info!(
+        "[tip_only_auto] cu_limit={cu_limit} cu_price={cu_price} fired {} tx(s)",
+        sigs.len()
+    );
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
 // ── dispatch_tip_only ────────────────────────────────────────────────────────
 
 /// 纯 tip 竞价：不参与 cu_price 竞争，全平台一发，tip 至少 `min_tip_floor`。
@@ -493,13 +546,10 @@ pub(crate) async fn dispatch_tip_only<O: SlotOracle>(
     timeout_secs: u64,
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
-        SendRoute::Harmonic => {
-            tip_only_harmonic(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
-        }
+        SendRoute::Harmonic => tip_only_harmonic(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
         SendRoute::Jito => tip_only_jito(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
-        SendRoute::Fallback => {
-            tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await
-        }
+        SendRoute::Fallback => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
+        SendRoute::TipOnly => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send_tip_only failed"))
 }
@@ -512,15 +562,16 @@ async fn fire_all_parallel(
     ctx: &SendContext,
     min_tip_floor: u64,
     cu_limit: u32,
+    cu_price: Option<u64>,
     memo: Option<String>,
     sigs: &mut HashSet<Signature>,
 ) {
-    use std::sync::Mutex;
     use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, SendTxEncoded};
+    use std::sync::Mutex;
 
     let sigs_shared = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
-    let cu = (Some(cu_limit), None);
+    let cu = (Some(cu_limit), cu_price);
 
     macro_rules! spawn_fire {
         ($client_opt:expr) => {
@@ -542,32 +593,51 @@ async fn fire_all_parallel(
                             let sig = env.sig();
                             let b64 = match env.inner_tx().to_base64() {
                                 Ok(b) => b,
-                                Err(e) => { log::error!("[par] {} serialize: {}", c, e); return; }
+                                Err(e) => {
+                                    log::error!("[par] {} serialize: {}", c, e);
+                                    return;
+                                }
                             };
                             log::info!("[par] 🚀 {} sending {}", c, sig);
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
-                            tokio::spawn(async move { let _ = sender.send_tx_encoded(&b64).await; });
+                            tokio::spawn(async move {
+                                let _ = sender.send_tx_encoded(&b64).await;
+                            });
                         }
-                        Err(e) => { log::error!("[par] {} build: {}", c, e); }
+                        Err(e) => {
+                            log::error!("[par] {} build: {}", c, e);
+                        }
                     }
                 }));
             }
         };
     }
 
-    #[cfg(feature = "everstake_quic")] spawn_fire!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))] spawn_fire!(d.everstake);
-    #[cfg(feature = "astralane_quic")] spawn_fire!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))] spawn_fire!(d.astralane);
-    #[cfg(feature = "flash_block")] spawn_fire!(d.flash_block);
-    #[cfg(feature = "temporal")] spawn_fire!(d.temporal);
-    #[cfg(feature = "zeroslot")] spawn_fire!(d.zeroslot);
-    #[cfg(feature = "nodeone")] spawn_fire!(d.nodeone);
-    #[cfg(feature = "blockrazor")] spawn_fire!(d.blockrazor);
-    #[cfg(feature = "helius")] spawn_fire!(d.helius);
-    #[cfg(feature = "nextblock")] spawn_fire!(d.nextblock);
-    #[cfg(feature = "stellium")] spawn_fire!(d.stellium);
+    #[cfg(feature = "everstake_quic")]
+    spawn_fire!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    spawn_fire!(d.everstake);
+    #[cfg(feature = "astralane_quic")]
+    spawn_fire!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    spawn_fire!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    spawn_fire!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    spawn_fire!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    spawn_fire!(d.zeroslot);
+    #[cfg(feature = "nodeone")]
+    spawn_fire!(d.nodeone);
+    #[cfg(feature = "blockrazor")]
+    spawn_fire!(d.blockrazor);
+    #[cfg(feature = "helius")]
+    spawn_fire!(d.helius);
+    #[cfg(feature = "nextblock")]
+    spawn_fire!(d.nextblock);
+    #[cfg(feature = "stellium")]
+    spawn_fire!(d.stellium);
 
     for h in handles {
         let _ = h.await;
@@ -630,10 +700,7 @@ async fn tip_only_harmonic<O: SlotOracle>(
         } else {
             0
         };
-        let harmonic_cu = (
-            Some(cu_limit),
-            if cu_price > 0 { Some(cu_price) } else { None },
-        );
+        let harmonic_cu = (Some(cu_limit), if cu_price > 0 { Some(cu_price) } else { None });
         fire_client(
             c,
             ixs,
@@ -647,7 +714,17 @@ async fn tip_only_harmonic<O: SlotOracle>(
         );
     }
 
-    fire_all_parallel(d, ixs, ctx, min_tip_floor, cu_limit, Some(MEMO_TAG.to_string()), &mut sigs).await;
+    fire_all_parallel(
+        d,
+        ixs,
+        ctx,
+        min_tip_floor,
+        cu_limit,
+        None,
+        Some(MEMO_TAG.to_string()),
+        &mut sigs,
+    )
+    .await;
     log::info!("[tip_only_harmonic] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
@@ -719,7 +796,17 @@ async fn tip_only_fallback<O: SlotOracle>(
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
 
-    fire_all_parallel(d, ixs, ctx, min_tip_floor, cu_limit, Some(MEMO_TAG.to_string()), &mut sigs).await;
+    fire_all_parallel(
+        d,
+        ixs,
+        ctx,
+        min_tip_floor,
+        cu_limit,
+        None,
+        Some(MEMO_TAG.to_string()),
+        &mut sigs,
+    )
+    .await;
     log::info!("[tip_only_fallback] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
