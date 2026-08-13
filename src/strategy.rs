@@ -566,7 +566,7 @@ async fn fire_all_parallel(
     memo: Option<String>,
     sigs: &mut HashSet<Signature>,
 ) {
-    use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, SendTxEncoded};
+    use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, SendTx};
     use std::sync::Mutex;
 
     let sigs_shared = Arc::new(Mutex::new(Vec::new()));
@@ -591,18 +591,12 @@ async fn fire_all_parallel(
                     match c.build_v0_tx(&ixs, &payer, &tip, &hash_param, &cu, &alt, memo_vec) {
                         Ok(env) => {
                             let sig = env.sig();
-                            let b64 = match env.inner_tx().to_base64() {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    log::error!("[par] {} serialize: {}", c, e);
-                                    return;
-                                }
-                            };
+                            let tx = env.inner_tx().clone();
                             log::info!("[par] 🚀 {} sending {}", c, sig);
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
                             tokio::spawn(async move {
-                                let _ = sender.send_tx_encoded(&b64).await;
+                                let _ = sender.send_tx(&tx).await;
                             });
                         }
                         Err(e) => {

@@ -5,7 +5,7 @@
 //! 这样避免了 TxEnvelope<'a, C> 的 'a 生命周期跨 spawn 边界问题。
 
 use ahash::AHashSet as HashSet;
-use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, HashParam, SendTxEncoded};
+use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, HashParam, SendTx};
 use solana_sdk::{
     instruction::Instruction,
     message::AddressLookupTableAccount,
@@ -29,21 +29,16 @@ pub fn fire_client<C>(
     memo: Option<&str>,
     sigs: &mut HashSet<Signature>,
 ) where
-    C: BuildV0Tx + BuildTx + SendTxEncoded + Display + Sync + Send + 'static,
+    C: BuildV0Tx + BuildTx + SendTx + Display + Sync + Send + 'static,
 {
-    // ① build（借用 *client），提取 sig + b64，TxEnvelope 在 block 尾部 drop
-    let (sig, b64) = {
+    // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
+    let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
         match client.build_v0_tx(ixs, payer, &tip, hash_param, cu, alt, memo_vec) {
             Ok(env) => {
                 let sig = env.sig();
-                match env.inner_tx().to_base64() {
-                    Ok(b) => (sig, b),
-                    Err(e) => {
-                        log::error!("[fire] {} serialize failed: {}", client, e);
-                        return;
-                    }
-                }
+                let tx = env.inner_tx().clone();
+                (sig, tx)
                 // env dropped here → 借用释放
             }
             Err(e) => {
@@ -59,7 +54,7 @@ pub fn fire_client<C>(
 
     let sender = Arc::clone(client);
     tokio::spawn(async move {
-        if let Err(e) = sender.send_tx_encoded(&b64).await {
+        if let Err(e) = sender.send_tx(&tx).await {
             log::error!("[fire] {} send failed: {}", sender, e);
         }
     });
