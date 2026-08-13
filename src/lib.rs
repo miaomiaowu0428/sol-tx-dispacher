@@ -21,11 +21,13 @@
 //! ```
 
 mod builder;
+mod bundle;
 mod context;
 mod fire;
 mod strategy;
 
 pub use builder::TxDispacherBuilder;
+pub use bundle::{MultiBundleError, MultiBundleSender};
 pub use context::SendContext;
 
 use nonce_cache::TxConfirmError;
