@@ -32,6 +32,7 @@ pub use context::SendContext;
 
 use nonce_cache::TxConfirmError;
 use sol_slot_leader::SlotOracle;
+use sol_tx_send::platform_clients::BundleSender;
 use std::sync::Arc;
 
 /// 走 tip-only 模式的 leader vote account（只靠 tip 竞价，不参与 cu_price 竞争）
@@ -174,6 +175,31 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// 返回 builder。
     pub fn builder(oracle: O) -> TxDispacherBuilder<O> {
         TxDispacherBuilder::new(oracle)
+    }
+
+    /// 构造默认注入 4 个 bundle 平台（Jito / Astralane / FlashBlock / Helius）的
+    /// 多平台 bundle 发送器，用于把同一个原子 bundle 并发发到这些平台。
+    ///
+    /// 各平台按 feature 开关存在，未启用的自动跳过。可直接链式 `append(...)` 后 `send(timeout)`。
+    pub fn bundle_sender(&self) -> MultiBundleSender {
+        let mut senders: Vec<Box<dyn BundleSender>> = Vec::new();
+        #[cfg(feature = "jito")]
+        if let Some(c) = &self.jito {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "astralane")]
+        if let Some(c) = &self.astralane {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "flash_block")]
+        if let Some(c) = &self.flash_block {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "helius")]
+        if let Some(c) = &self.helius {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        MultiBundleSender::new(senders)
     }
 
     /// 查询当前 slot 的路由决策（不发送）。
