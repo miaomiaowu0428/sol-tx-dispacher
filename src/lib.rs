@@ -249,6 +249,29 @@ impl<O: SlotOracle> TxDispacher<O> {
             .map_err(into_tx_confirm_err)
     }
 
+    /// 同 `send()`，但强制跳过 Harmonic 路由：Harmonic leader 出块时也走 Fallback 全平台。
+    ///
+    /// 用于不希望走 Harmonic 的策略（如 tip→cu_price 转换、Harmonic 竞价行为），
+    /// 其余路由（Jito / TipOnly / Fallback）行为与 `send()` 完全一致。
+    pub async fn send_skip_harmonic(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        tip_strategy: Option<TipStrategy>,
+        cu: (Option<u32>, Option<u64>),
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        let mut route = self.resolve_route(target_slot);
+        if route == SendRoute::Harmonic {
+            log::info!("[TxDispacher] slot={} route=Harmonic → 跳过，强制 Fallback", target_slot);
+            route = SendRoute::Fallback;
+        }
+        strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
     /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
     ///
     /// 适合卖出等不极限抢速的场景，屾岜山全量平台广播带来的额外费用。
