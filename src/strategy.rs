@@ -490,10 +490,15 @@ async fn tip_only_auto<O: SlotOracle>(
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
 
-    // cu_price 自动调整：总价 = cu_price × cu_limit / 1_000_000 ≤ 0.0001 SOL = 100_000 lamports
+    // cu_price：以 max_price（总 priority fee ≤ 0.0001 SOL 反推）作为上限，
+    // 调用方显式传入的小值原样保留（不强制抬到上限），只有超过上限才被 clamp；
+    // 无输入时用 80% 上限兜底（保持原有默认行为）。
     let cu_limit = cu.0.unwrap_or(200_000);
     let max_price = 100_000u64.saturating_mul(1_000_000) / cu_limit as u64;
-    let cu_price = (max_price as f64 * 0.8) as u64; // 留 20% 余量
+    let cu_price = match cu.1 {
+        Some(p) => p.min(max_price),
+        None => (max_price as f64 * 0.8) as u64,
+    };
 
     // 用 tip_strategy 或 5000 lamports 作为最低 tip
     let min_tip_floor = tip_strategy.map(|s| s.compute(0)).unwrap_or(5_000);
