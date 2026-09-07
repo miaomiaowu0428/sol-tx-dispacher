@@ -1,11 +1,11 @@
 //! FIFO leader 配置。
 //!
-//! 这些 leader 采用先到先得（FIFO）出块、不参与 tip / cu_price 竞价。
-//! 命中时发送强制 tip=None、cu_price=None（不管上游传什么）。
+//! 这些 leader 采用先到先得（FIFO）出块、不参与 cu_price 竞价。
+//! 命中时发送：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None。
 //!
 //! 数据来源：`config/FIFO-Leader.json`（(leader vote account, client_type_id) 快照），硬编码于此。
 
-/// 走 FIFO（不参与 tip/cu_price 竞价）的 (leader vote account, client_type_id) 列表。
+/// 走 FIFO（不参与 cu_price 竞价）的 (leader vote account, client_type_id) 列表。
 pub const FIFO_LEADERS: &[(solana_sdk::pubkey::Pubkey, u16)] = &[
     (solana_sdk::pubkey!("Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk"), 8),
     (solana_sdk::pubkey!("Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk"), 1),

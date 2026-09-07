@@ -228,7 +228,7 @@ impl<O: SlotOracle> TxDispacher<O> {
     }
 
     /// 目标 slot 的 leader 是否命中 FIFO 表（leader vote account + client_type_id 都匹配）。
-    /// FIFO leader 不参与 tip / cu_price 竞价，发送时应强制无 tip、无 cu_price。
+    /// FIFO leader 命中时：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与竞价）。
     fn is_fifo_leader(&self, slot: u64) -> bool {
         if let Some(info) = self.oracle.leader_at(slot) {
             if let (Some(pk), Some(ctid)) = (info.leader_pubkey().copied(), info.client_type_id) {
@@ -258,10 +258,10 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
-        // FIFO leader：强制 tip=None、cu_price=None（不管上游传什么），仍照常 dispatch
+        // FIFO leader：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与 cu_price 竞价）。
         if self.is_fifo_leader(target_slot) {
             log::info!(
-                "[TxDispacher] slot={} route={:?} 命中 FIFO leader → 强制 tip=None cu_price=None",
+                "[TxDispacher] slot={} route={:?} 命中 FIFO leader → tip=None cu=(limit, None)",
                 target_slot,
                 route
             );
