@@ -32,6 +32,7 @@ pub fn fire_client<C>(
     C: BuildV0Tx + BuildTx + SendTx + Display + Sync + Send + 'static,
 {
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
+    let build_t0 = std::time::Instant::now();
     let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
         match client.build_v0_tx(ixs, payer, &tip, hash_param, cu, alt, memo_vec) {
@@ -47,15 +48,23 @@ pub fn fire_client<C>(
             }
         }
     };
+    let build_elapsed = build_t0.elapsed();
 
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
     log::info!("[fire] 🚀 {} sending {}", client, sig);
 
     let sender = Arc::clone(client);
+    let platform = client.to_string();
     tokio::spawn(async move {
+        let send_t0 = std::time::Instant::now();
         if let Err(e) = sender.send_tx(&tx).await {
             log::error!("[fire] {} send failed: {}", sender, e);
         }
+        // ③ 单条 log：构建耗时 + 发送耗时（发送为交给平台、不等链上确认），按 sig 可查
+        log::info!(
+            "📤 [send] platform={platform} sig={sig} 构建耗时:{build_elapsed:?} 发送耗时:{:?}",
+            send_t0.elapsed()
+        );
     });
 }
