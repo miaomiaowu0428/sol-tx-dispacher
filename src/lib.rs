@@ -23,6 +23,7 @@
 mod builder;
 mod bundle;
 mod context;
+mod fifo;
 mod fire;
 mod strategy;
 
@@ -30,6 +31,7 @@ pub use builder::TxDispacherBuilder;
 pub use bundle::{MultiBundleError, MultiBundleSender};
 pub use context::SendContext;
 
+use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
 use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::BundleSender;
@@ -49,6 +51,8 @@ const TIP_ONLY_LEADERS: &[solana_sdk::pubkey::Pubkey] = &[
     solana_sdk::pubkey!("ChorusmmK7i1AxXeiTtQgQZhQNiXYU84ULeaYF1EH15n"),
 ];
 
+/// 走 FIFO（先到先得、不参与 tip/cu_price 竞价）的 (leader vote account, client_type_id) 列表。
+/// 定义见 `fifo.rs`（硬编码自 config/FIFO-Leader.json）。命中时发送强制 tip=None、cu_price=None。
 // ── TipStrategy ───────────────────────────────────────────────────────────────
 
 /// Tip 计算策略（与 trade-solana-impl send_utils 保持相同语义）。
@@ -223,6 +227,17 @@ impl<O: SlotOracle> TxDispacher<O> {
         }
     }
 
+    /// 目标 slot 的 leader 是否命中 FIFO 表（leader vote account + client_type_id 都匹配）。
+    /// FIFO leader 不参与 tip / cu_price 竞价，发送时应强制无 tip、无 cu_price。
+    fn is_fifo_leader(&self, slot: u64) -> bool {
+        if let Some(info) = self.oracle.leader_at(slot) {
+            if let (Some(pk), Some(ctid)) = (info.leader_pubkey().copied(), info.client_type_id) {
+                return FIFO_LEADERS.contains(&(pk, ctid));
+            }
+        }
+        false
+    }
+
     /// 主发送入口。
     ///
     /// - `tip_strategy` 为 `None` 时各策略使用内置默认：
@@ -243,30 +258,18 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
-        log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
-        strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs)
-            .await
-            .map_err(into_tx_confirm_err)
-    }
-
-    /// 同 `send()`，但强制跳过 Harmonic 路由：Harmonic leader 出块时也走 Fallback 全平台。
-    ///
-    /// 用于不希望走 Harmonic 的策略（如 tip→cu_price 转换、Harmonic 竞价行为），
-    /// 其余路由（Jito / TipOnly / Fallback）行为与 `send()` 完全一致。
-    pub async fn send_skip_harmonic(
-        &self,
-        ixs: &[solana_sdk::instruction::Instruction],
-        ctx: &SendContext,
-        target_slot: u64,
-        tip_strategy: Option<TipStrategy>,
-        cu: (Option<u32>, Option<u64>),
-        confirm_timeout_secs: u64,
-    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let mut route = self.resolve_route(target_slot);
-        if route == SendRoute::Harmonic {
-            log::info!("[TxDispacher] slot={} route=Harmonic → 跳过，强制 Fallback", target_slot);
-            route = SendRoute::Fallback;
+        // FIFO leader：强制 tip=None、cu_price=None（不管上游传什么），仍照常 dispatch
+        if self.is_fifo_leader(target_slot) {
+            log::info!(
+                "[TxDispacher] slot={} route={:?} 命中 FIFO leader → 强制 tip=None cu_price=None",
+                target_slot,
+                route
+            );
+            return strategy::dispatch(self, ixs, ctx, route, None, (cu.0, None), confirm_timeout_secs)
+                .await
+                .map_err(into_tx_confirm_err);
         }
+        log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
         strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs)
             .await
             .map_err(into_tx_confirm_err)
@@ -341,6 +344,7 @@ mod tests {
                     ClientType::Agave
                 },
                 name: self.name.map(str::to_string),
+                client_type_id: None,
             })
         }
     }
