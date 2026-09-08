@@ -85,6 +85,30 @@ impl TipStrategy {
     }
 }
 
+// ── CostConfig ────────────────────────────────────────────────────────────────
+
+/// 单预算竞价配置：把「tip 高度 + cu_price」二维参数合并成单个 cost 预算，
+/// 由内部根据平台性质决定走 tip 通道还是 cu_price 通道（或同一平台双发两笔）。
+///
+/// 语义：`cost_amount` 是这笔交易愿意付出的**单笔竞价总预算**（lamports）。
+/// 因为 ctx 送 nonce，同平台双发/全平台广播只会有一笔成功上链、只付一次费，
+/// 所以带 price 那笔和纯 tip 那笔各自都能尽力花到 `cost_amount`，无需拆预算。
+///
+/// 内部通道推导：
+/// - **cu_price 通道**（带 price 那笔 / 只收 gas 的平台）：
+///   `cu_price = cost_amount × 1e6 / cu_limit`，tip 用 `tip_rate` 保底（比平台默认高一点点）。
+/// - **tip 通道**（纯 tip 那笔 / jito 等）：tip = `Absolute(cost_amount)` 全额。
+#[derive(Debug, Clone, Copy)]
+pub struct CostConfig {
+    /// 单笔竞价总预算（lamports）。走 tip 通道即全额 tip；走 cu_price 通道经 cu_limit 换算。
+    pub cost_amount: u64,
+    /// compute units 上限。用于把 `cost_amount` 换算成 `cu_price`（micro-lamports/CU）。
+    pub cu_limit: u32,
+    /// “高 gas”那笔的 tip 倍率（相对平台最低 tip，如 1.01 / 1.05），
+    /// 保证带 cu_price 的交易不至于因 tip 不足被平台丢弃，但不过度抬高。
+    pub tip_rate: f64,
+}
+
 // ── feature-gated 平台客户端导入 ──────────────────────────────────────────────
 
 #[cfg(feature = "astralane")]
@@ -314,6 +338,59 @@ impl<O: SlotOracle> TxDispacher<O> {
             min_tip_floor
         );
         strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
+    /// 单预算竞价发送——把 tip/cu_price 二维参数合并为单个 cost 预算。
+    ///
+    /// 语义：`config.cost_amount` 是这笔交易愿意付出的单笔竞价总预算（lamports）。
+    /// 内部根据平台性质推导通道：
+    /// - 走 **cu_price 通道** 的平台/那笔：`cu_price = cost × 1e6 / cu_limit`，
+    ///   tip 用 `config.tip_rate` 保底（保证带 cu_price 的交易不被平台以 tip 不足丢弃）；
+    /// - 走 **tip 通道** 的平台/那笔（jito、纯 tip 那笔）：tip = 全额 `cost_amount`。
+    ///
+    /// 因为 ctx 送 single nonce，同平台 `fire_both` 双发 / 全平台广播只会有一笔
+    /// 成功上链、只付一次费，故两笔各自都能尽力花到 `cost_amount`，不拆预算。
+    /// 路由逻辑与 [`send`] 一致（Harmonic / Jito / Fallback / TipOnly / FIFO）。
+    pub async fn send_with_cost(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        config: CostConfig,
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        let route = self.resolve_route(target_slot);
+        // FIFO leader：不参与 tip/cu_price 竞价（靠先到先得），cost 不生效，
+        // 只保留 cu_limit，tip=None、cu_price=None。
+        if self.is_fifo_leader(target_slot) {
+            log::info!(
+                "[TxDispacher::send_with_cost] slot={} route={:?} 命中 FIFO leader → cost 不生效 tip=None cu=(limit, None)",
+                target_slot,
+                route
+            );
+            return strategy::dispatch(
+                self,
+                ixs,
+                ctx,
+                route,
+                None,
+                (Some(config.cu_limit), None),
+                confirm_timeout_secs,
+            )
+            .await
+            .map_err(into_tx_confirm_err);
+        }
+        log::info!(
+            "[TxDispacher::send_with_cost] slot={} route={:?} cost={} cu_limit={} tip_rate={}",
+            target_slot,
+            route,
+            config.cost_amount,
+            config.cu_limit,
+            config.tip_rate
+        );
+        strategy::dispatch_with_cost(self, ixs, ctx, route, config, confirm_timeout_secs)
             .await
             .map_err(into_tx_confirm_err)
     }

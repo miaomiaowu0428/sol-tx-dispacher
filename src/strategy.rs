@@ -3,7 +3,7 @@
 //! - `harmonic_mode` : Harmonic 直发（不加 tip）+ Astralane/Temporal 带 90% tip
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
-use crate::{SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
+use crate::{CostConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
 use ahash::AHashSet as HashSet;
 use grpc_client::TransactionFormat;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
@@ -32,6 +32,71 @@ pub(crate) async fn dispatch<O: SlotOracle>(
     };
     result.map_err(|e| anyhow::Error::from(e).context("send failed"))
 }
+
+// ── dispatch_with_cost ────────────────────────────────────────────────────────
+
+/// 单预算竞价分发——把 `CostConfig` 展开为两个 tip 值 + 一个 cu_price，按平台性质
+/// 分别喂给「带 cu_price 那笔」和「纯 tip 那笔」，然后走 route → mode 分发。
+///
+/// 为什么不能纯转接给 `dispatch`：`dispatch` 只接受一个 `tip_strategy`，无法同时表达
+/// cost 语义需要的**两个 tip 值**——
+/// - **低 tip 比例**（`tip_rate`）：给带 cu_price 那笔做保底（替代 fallback 里写死的 1.05）；
+/// - **高 tip 绝对值**（`cost_amount`）：给纯 tip / no_price 那笔。
+///
+/// 若把 `cost` 一刀切转成 `Absolute(cost_amount)` 传给 `dispatch`，带 price 那笔会拿不到
+/// `tip_rate`（被写死 1.05 挡住），`tip_rate` 字段形同虚设。故 Fallback 用全新
+/// `fallback_cost_mode` 显式区分两值；Harmonic/Jito/TipOnly 本就单 tip 语义，复用原 mode
+/// 并把 `Absolute(cost_amount)` 作为其 tip 预算。
+pub(crate) async fn dispatch_with_cost<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    route: SendRoute,
+    config: CostConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let result = match route {
+        SendRoute::Fallback => fallback_cost_mode(d, ixs, ctx, config, timeout_secs).await,
+        // Harmonic / Jito / TipOnly：单 tip 语义，cost 全额作为 tip 预算，
+        // cu_limit 透传、无 cu_price（Harmonic 主体内部会把 tip 转 cu_price）。
+        SendRoute::Harmonic => {
+            harmonic_mode(
+                d,
+                ixs,
+                ctx,
+                Some(TipStrategy::Absolute(config.cost_amount)),
+                (Some(config.cu_limit), None),
+                timeout_secs,
+            )
+            .await
+        }
+        SendRoute::Jito => {
+            jito_mode(
+                d,
+                ixs,
+                ctx,
+                Some(TipStrategy::Absolute(config.cost_amount)),
+                (Some(config.cu_limit), None),
+                timeout_secs,
+            )
+            .await
+        }
+        SendRoute::TipOnly => {
+            tip_only_auto(
+                d,
+                ixs,
+                ctx,
+                Some(TipStrategy::Absolute(config.cost_amount)),
+                (Some(config.cu_limit), None),
+                timeout_secs,
+            )
+            .await
+        }
+    };
+    result.map_err(|e| anyhow::Error::from(e).context("send_with_cost failed"))
+}
+
+
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────────────
 
@@ -412,6 +477,171 @@ async fn fallback_mode<O: SlotOracle>(
     fire_no_price!(d.jito, tip: tip_strategy);
 
     log::info!("[fallback_mode] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── fallback_cost_mode ────────────────────────────────────────────────────────
+
+/// cost 语义下的 fallback（对应 `CostConfig` 单预算）。
+///
+/// 与 [`fallback_mode`] 结构一致，但显式区分 cost 语义需要的**两个 tip 值**，
+/// 避免「带 cu_price 那笔」和「纯 tip 那笔」被一刀切塞同一个 tip：
+/// - **带 price 那笔**（`fire_with_price` / `fire_both` 的 with_price 笔）：
+///   tip = `Ratio(config.tip_rate)`（低比例保底，替代 fallback 写死的 1.05），
+///   cu_price = `cost_amount × 1e6 / cu_limit`（cost 全额换算到 gas）。
+/// - **纯 tip 那笔**（`fire_both` 的 no_price 笔 / jito）：tip = `Absolute(cost_amount)` 全额。
+///
+/// single nonce → 全平台只有一笔上链、只付一次费，故两笔各自尽力花到 `cost_amount`。
+async fn fallback_cost_mode<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    config: CostConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let CostConfig {
+        cost_amount,
+        cu_limit,
+        tip_rate,
+    } = config;
+
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    // 带 price 那笔的 cu_price：cost 全额经 cu_limit 换算（micro-lamports/CU）。
+    let cu_price = if cu_limit > 0 {
+        cost_amount.saturating_mul(1_000_000) / cu_limit as u64
+    } else {
+        0
+    };
+    let cu = (
+        Some(cu_limit),
+        if cu_price > 0 { Some(cu_price) } else { None },
+    );
+    let cu_no_price = (Some(cu_limit), None);
+
+    // 两个 tip 值：带 price 那笔用低比例保底，纯 tip 那笔用全额。
+    let with_price_tip = Some(TipStrategy::Ratio(tip_rate));
+    let no_price_tip = Some(TipStrategy::Absolute(cost_amount));
+
+    macro_rules! fire_with_price {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(with_price_tip, min);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    macro_rules! fire_both {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let t1 = opt_tip(with_price_tip, min);
+                let t2 = opt_tip(no_price_tip, min);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t1,
+                    &ctx.hash_param,
+                    &cu,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t2,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    macro_rules! fire_no_price {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(no_price_tip, min);
+                fire_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    &cu_no_price,
+                    &ctx.alt,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    log::info!(
+        "[fallback_cost_mode] cost={} cu_limit={} tip_rate={} → cu_price={}",
+        cost_amount,
+        cu_limit,
+        tip_rate,
+        cu_price
+    );
+
+    // ── 平台组合（与 fallback_mode 一致，只是 tip 值换成 cost 语义） ─────
+    #[cfg(feature = "everstake_quic")]
+    fire_with_price!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_with_price!(d.everstake);
+
+    #[cfg(feature = "astralane_quic")]
+    fire_both!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_both!(d.astralane);
+
+    #[cfg(feature = "flash_block")]
+    fire_both!(d.flash_block);
+
+    #[cfg(feature = "nodeone")]
+    fire_with_price!(d.nodeone);
+    #[cfg(feature = "blockrazor")]
+    fire_with_price!(d.blockrazor);
+
+    #[cfg(feature = "temporal")]
+    fire_both!(d.temporal);
+
+    #[cfg(feature = "helius")]
+    fire_with_price!(d.helius);
+
+    #[cfg(feature = "zeroslot")]
+    fire_both!(d.zeroslot);
+
+    #[cfg(feature = "nextblock")]
+    fire_with_price!(d.nextblock);
+    #[cfg(feature = "stellium")]
+    fire_with_price!(d.stellium);
+
+    // Jito bundle 靠 tip 排序 → 只发 no_price（全额 tip）
+    #[cfg(feature = "jito")]
+    fire_no_price!(d.jito);
+
+    log::info!("[fallback_cost_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
