@@ -126,7 +126,9 @@ use sol_tx_send::platform_clients::flash_block::FlashBlock;
 #[cfg(feature = "harmonic")]
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 #[cfg(feature = "helius")]
-use sol_tx_send::platform_clients::helius::Helius;
+use sol_tx_send::platform_clients::helius_max::HeliusMax;
+#[cfg(feature = "helius")]
+use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 #[cfg(feature = "jito")]
 use sol_tx_send::platform_clients::jito::Jito;
 #[cfg(feature = "nextblock")]
@@ -180,7 +182,9 @@ pub struct TxDispacher<O: SlotOracle> {
     #[cfg(feature = "temporal")]
     pub(crate) temporal: Option<Arc<Temporal>>,
     #[cfg(feature = "helius")]
-    pub(crate) helius: Option<Arc<Helius>>,
+    pub(crate) helius_max: Option<Arc<HeliusMax>>,
+    #[cfg(feature = "helius")]
+    pub(crate) helius_swqos: Option<Arc<HeliusSwqos>>,
     #[cfg(feature = "zeroslot")]
     pub(crate) zeroslot: Option<Arc<ZeroSlot>>,
     #[cfg(feature = "nextblock")]
@@ -205,10 +209,11 @@ impl<O: SlotOracle> TxDispacher<O> {
         TxDispacherBuilder::new(oracle)
     }
 
-    /// 构造默认注入 4 个 bundle 平台（Jito / Astralane / FlashBlock / Helius）的
+    /// 构造默认注入 4 个 bundle 平台（Jito / Astralane / FlashBlock / Helius Max）的
     /// 多平台 bundle 发送器，用于把同一个原子 bundle 并发发到这些平台。
     ///
     /// 各平台按 feature 开关存在，未启用的自动跳过。可直接链式 `append(...)` 后 `send(timeout)`。
+    /// 注：SWQOS-only 档位不支持 bundle，故不在此列。
     pub fn bundle_sender(&self) -> MultiBundleSender {
         let mut senders: Vec<Box<dyn BundleSender>> = Vec::new();
         #[cfg(feature = "jito")]
@@ -224,7 +229,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             senders.push(Box::new(c.as_ref().clone()));
         }
         #[cfg(feature = "helius")]
-        if let Some(c) = &self.helius {
+        if let Some(c) = &self.helius_max {
             senders.push(Box::new(c.as_ref().clone()));
         }
         MultiBundleSender::new(senders)

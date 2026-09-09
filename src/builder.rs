@@ -19,7 +19,9 @@ use sol_tx_send::platform_clients::flash_block::FlashBlock;
 #[cfg(feature = "harmonic")]
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 #[cfg(feature = "helius")]
-use sol_tx_send::platform_clients::helius::Helius;
+use sol_tx_send::platform_clients::helius_max::HeliusMax;
+#[cfg(feature = "helius")]
+use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 #[cfg(feature = "jito")]
 use sol_tx_send::platform_clients::jito::Jito;
 #[cfg(feature = "nextblock")]
@@ -54,7 +56,9 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     #[cfg(feature = "temporal")]
     temporal: Option<Arc<Temporal>>,
     #[cfg(feature = "helius")]
-    helius: Option<Arc<Helius>>,
+    helius_max: Option<Arc<HeliusMax>>,
+    #[cfg(feature = "helius")]
+    helius_swqos: Option<Arc<HeliusSwqos>>,
     #[cfg(feature = "zeroslot")]
     zeroslot: Option<Arc<ZeroSlot>>,
     #[cfg(feature = "nextblock")]
@@ -88,7 +92,9 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             #[cfg(feature = "temporal")]
             temporal: None,
             #[cfg(feature = "helius")]
-            helius: None,
+            helius_max: None,
+            #[cfg(feature = "helius")]
+            helius_swqos: None,
             #[cfg(feature = "zeroslot")]
             zeroslot: None,
             #[cfg(feature = "nextblock")]
@@ -153,8 +159,14 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     }
 
     #[cfg(feature = "helius")]
-    pub fn helius(mut self, c: Helius) -> Self {
-        self.helius = Some(Arc::new(c));
+    pub fn helius_max(mut self, c: HeliusMax) -> Self {
+        self.helius_max = Some(Arc::new(c));
+        self
+    }
+
+    #[cfg(feature = "helius")]
+    pub fn helius_swqos(mut self, c: HeliusSwqos) -> Self {
+        self.helius_swqos = Some(Arc::new(c));
         self
     }
 
@@ -210,7 +222,9 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             #[cfg(feature = "temporal")]
             temporal: self.temporal,
             #[cfg(feature = "helius")]
-            helius: self.helius,
+            helius_max: self.helius_max,
+            #[cfg(feature = "helius")]
+            helius_swqos: self.helius_swqos,
             #[cfg(feature = "zeroslot")]
             zeroslot: self.zeroslot,
             #[cfg(feature = "nextblock")]

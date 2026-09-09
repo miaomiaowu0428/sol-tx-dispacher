@@ -44,6 +44,7 @@ flash_block     = []
 nodeone         = []
 blockrazor      = []
 temporal        = []
+# Helius Sender：Max 与 SWQOS-only 共用同一 key + 同一 feature，同开同关
 helius          = []
 zeroslot        = []
 nextblock       = []

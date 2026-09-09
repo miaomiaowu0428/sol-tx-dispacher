@@ -225,7 +225,10 @@ async fn harmonic_mode<O: SlotOracle>(
     fire_no_price!(d.blockrazor, tip: tip_strategy);
 
     #[cfg(feature = "helius")]
-    fire_no_price!(d.helius, tip: tip_strategy);
+    fire_no_price!(d.helius_max, tip: tip_strategy);
+
+    #[cfg(feature = "helius")]
+    fire_no_price!(d.helius_swqos, tip: tip_strategy);
 
     #[cfg(feature = "zeroslot")]
     fire_no_price!(d.zeroslot, tip: tip_strategy);
@@ -458,7 +461,10 @@ async fn fallback_mode<O: SlotOracle>(
     );
 
     #[cfg(feature = "helius")]
-    fire_with_price!(d.helius, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_with_price!(d.helius_max, tip: Some(TipStrategy::Ratio(1.05)));
+
+    #[cfg(feature = "helius")]
+    fire_with_price!(d.helius_swqos, tip: Some(TipStrategy::Ratio(1.05)));
 
     #[cfg(feature = "zeroslot")]
     fire_both!(d.zeroslot,
@@ -627,7 +633,10 @@ async fn fallback_cost_mode<O: SlotOracle>(
     fire_both!(d.temporal);
 
     #[cfg(feature = "helius")]
-    fire_with_price!(d.helius);
+    fire_with_price!(d.helius_max);
+
+    #[cfg(feature = "helius")]
+    fire_with_price!(d.helius_swqos);
 
     #[cfg(feature = "zeroslot")]
     fire_both!(d.zeroslot);
@@ -733,9 +742,9 @@ async fn tip_only_auto<O: SlotOracle>(
     // 用 tip_strategy 或 5000 lamports 作为最低 tip
     let min_tip_floor = tip_strategy.map(|s| s.compute(0)).unwrap_or(5_000);
 
-    // Helius 先发
+    // Helius Max 先发（高优先级单发）
     #[cfg(feature = "helius")]
-    if let Some(c) = &d.helius {
+    if let Some(c) = &d.helius_max {
         let tip = Some(min_tip_floor.max(c.as_ref().get_min_tip_amount()));
         fire_client(
             c,
@@ -862,7 +871,9 @@ async fn fire_all_parallel(
     #[cfg(feature = "blockrazor")]
     spawn_fire!(d.blockrazor);
     #[cfg(feature = "helius")]
-    spawn_fire!(d.helius);
+    spawn_fire!(d.helius_max);
+    #[cfg(feature = "helius")]
+    spawn_fire!(d.helius_swqos);
     #[cfg(feature = "nextblock")]
     spawn_fire!(d.nextblock);
     #[cfg(feature = "stellium")]
@@ -899,7 +910,9 @@ macro_rules! fire_all_tip_platforms {
         #[cfg(feature = "blockrazor")]
         $fire!($d.blockrazor);
         #[cfg(feature = "helius")]
-        $fire!($d.helius);
+        $fire!($d.helius_max);
+        #[cfg(feature = "helius")]
+        $fire!($d.helius_swqos);
         #[cfg(feature = "nextblock")]
         $fire!($d.nextblock);
         #[cfg(feature = "stellium")]
