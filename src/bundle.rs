@@ -3,7 +3,7 @@
 //! 将同一组原子 bundle（多笔交易）并发代理到多个平台，并在发送后通过
 //! `nonce_cache` 的 confirm 系列方法确认任意一笔上链。`append` 参数与
 //! `sol_tx_send::platform_clients::BundleBuilder` 完全对齐，`send()` 内部完成
-//! 订阅 → 并发发送 → 整理每平台首笔签名 → 确认的完整流程。
+//! 订阅 → 并发发送 → 整理各平台全部签名 → 确认的完整流程。
 //!
 //! 本模块不依赖 slot/oracle 路由——纯多平台广播。适合"同一批交易必须原子执行、
 //! 想提高落地概率"的场景（如 snipe 的 buy+tip 组合、迁移+买入打包等）。
@@ -118,8 +118,8 @@ impl MultiBundleSender {
     /// 1. 发送前先订阅 `tx_result_channel`，避免漏掉极速确认；
     /// 2. 所有平台并发发送（全部 spawn 出去，再统一 await）；**平台发送失败只打日志，
     ///    不参与结果**；
-    /// 3. 整理每平台 bundle 的**第一笔**签名作为监听集合
-    ///    （bundle 一荣俱荣一损俱损，确认第一笔 = 整个 bundle 已落地）；
+    /// 3. 整理每平台 bundle 的**全部**签名作为监听集合
+    ///    （任一平台任一笔确认到 = 整个 bundle 已落地）；
     /// 4. 调用 `confirm_success_tx`：交易失败 / Meta 缺失只打日志继续等，
     ///    只等任一平台成功确认或超时；
     /// 5. 最终只有两种结局——成功返回 `(Signature, TransactionFormat)`，或失败表现为
@@ -140,20 +140,20 @@ impl MultiBundleSender {
             handles.push(tokio::spawn(async move { b.send().await }));
         }
 
-        // 3. 收集每平台第一笔签名；发送失败不关心，只打 log
-        let mut first_sigs: HashSet<Signature> = HashSet::new();
+        // 3. 收集每平台 bundle 的【全部】签名；发送失败不关心，只打 log。
+        //    只盯首笔有风险：若首笔结果没被推送（网络/订阅原因），即使整个 bundle 已落地也会误报超时。
+        //    监听全部笔后，任一平台任一笔确认到即视为成功。
+        let mut watch_sigs: HashSet<Signature> = HashSet::new();
         for h in handles {
             match h.await {
                 Ok(Ok(sigs)) => {
-                    if let Some(first) = sigs.first() {
-                        first_sigs.insert(*first);
-                    }
+                    watch_sigs.extend(sigs);
                 }
                 Ok(Err(e)) => log::error!("[MultiBundleSender] 平台 bundle 发送失败: {e}"),
                 Err(e) => log::error!("[MultiBundleSender] task join error: {e}"),
             }
         }
-        if first_sigs.is_empty() {
+        if watch_sigs.is_empty() {
             // 没有任何平台成功发出签名 → 归为超时失败
             log::error!("[MultiBundleSender] 所有平台 bundle 发送失败，无签名可监听");
             return Err(TxConfirmError::Timeout {
@@ -163,6 +163,6 @@ impl MultiBundleSender {
         }
 
         // 4. 确认：忽略交易失败/Meta 缺失（打日志继续等），只等成功或超时
-        confirm_success_tx(rx, first_sigs, confirm_timeout_secs).await
+        confirm_success_tx(rx, watch_sigs, confirm_timeout_secs).await
     }
 }
