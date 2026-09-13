@@ -29,7 +29,7 @@ mod strategy;
 
 pub use builder::TxDispacherBuilder;
 pub use bundle::{MultiBundleError, MultiBundleSender};
-pub use context::SendContext;
+pub use context::{SendContext, merge_alts};
 
 use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
