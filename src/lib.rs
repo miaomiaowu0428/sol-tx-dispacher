@@ -235,6 +235,23 @@ impl<O: SlotOracle> TxDispacher<O> {
         MultiBundleSender::new(senders)
     }
 
+    /// 只用 **FlashBlock** 发一笔（不挑 leader、不参与 tip/cu_price 竞价）。
+    ///
+    /// tip 走平台最低、cu 按传入；fire-and-forget，不等确认 ——
+    /// 适合补 ATA 这类"发出去就行"的维护交易。返回 None 表示没配 FlashBlock。
+    #[cfg(feature = "flash_block")]
+    pub fn send_flashblock_only(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        cu: (Option<u32>, Option<u64>),
+    ) -> Option<solana_sdk::signature::Signature> {
+        let client = self.flash_block.as_ref()?;
+        let mut sigs = ahash::AHashSet::new();
+        fire::fire_client(client, ixs, &ctx.payer, None, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
+        sigs.into_iter().next()
+    }
+
     /// 查询当前 slot 的路由决策（不发送）。
     /// 查询 `target_slot` 的 leader 类型并返回路由决策。
     /// 调用方自行决定传当前 slot 还是 current_slot + N。
