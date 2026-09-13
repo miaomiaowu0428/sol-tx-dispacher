@@ -164,12 +164,14 @@ mod tests {
 
     #[test]
     fn with_alts_is_chainable() {
+        let a = mk_alt(1);
         let ctx = SendContext::new(
             Arc::new(Keypair::new()),
             HashParam::Blockhash(Hash::new_unique()),
             Arc::new(vec![]),
         )
-        .with_alts([mk_alt(1), mk_alt(1)]);
+        .with_alts([a.clone(), a.clone()]);
         assert_eq!(ctx.alt.len(), 1, "批内重复也要去重");
+        assert_eq!(ctx.alt[0].key, a.key);
     }
 }

@@ -426,6 +426,7 @@ mod tests {
                     ClientType::Agave
                 },
                 name: self.name.map(str::to_string),
+                leader: None,
                 client_type_id: None,
             })
         }
@@ -435,26 +436,26 @@ mod tests {
 
     #[test]
     fn noop_oracle_always_fallback() {
-        let d = TxDispacher::builder(Arc::new(NoopOracle)).build();
+        let d = TxDispacher::builder(NoopOracle).build();
         assert_eq!(d.resolve_route(422_000_000), SendRoute::Fallback);
     }
 
     #[test]
     fn harmonic_client_type_routes_to_harmonic() {
-        let d = TxDispacher::builder(Arc::new(MockOracle {
+        let d = TxDispacher::builder(MockOracle {
             harmonic: true,
             name: None,
-        }))
+        })
         .build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
     }
 
     #[test]
     fn non_harmonic_client_type_routes_to_fallback() {
-        let d = TxDispacher::builder(Arc::new(MockOracle {
+        let d = TxDispacher::builder(MockOracle {
             harmonic: false,
             name: None,
-        }))
+        })
         .build();
         assert_eq!(d.resolve_route(100), SendRoute::Fallback);
     }
