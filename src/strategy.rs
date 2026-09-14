@@ -3,12 +3,14 @@
 //! - `harmonic_mode` : Harmonic 直发（不加 tip）+ Astralane/Temporal 带 90% tip
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
-use crate::{CostConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client};
+use crate::{
+    CostConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client, fire::fire_v1_client,
+};
 use ahash::AHashSet as HashSet;
 use grpc_client::TransactionFormat;
 use nonce_cache::{TxConfirmError, confirm_tx, tx_result_channel};
 use sol_slot_leader::SlotOracle;
-use sol_tx_send::platform_clients::BuildTx;
+use sol_tx_send::platform_clients::{BuildTx, V1TxConfig};
 use solana_sdk::{instruction::Instruction, signature::Signature};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -1053,4 +1055,692 @@ async fn tip_only_fallback<O: SlotOracle>(
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_tip_only(fallback) failed: {}", e))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V1 版本
+//
+// 与 V0 的唯一差异是**构建参数**：
+//    V0: `cu: (Option<u32>, Option<u64>)` + `alt: &Arc<Vec<AddressLookupTableAccount>>`
+//    V1: `config: V1TxConfig`（CU 上限 + priority_fee + loaded_accounts_data_size + heap）
+//
+// V1 不支持地址查找表，账户全部内联，故没有 alt 参数。
+//
+// **priority_fee 的语义与 V0 的 cu_price 不同**：
+//   V0 `cu_price` 是单价（micro-lamports/CU），总费 = cu_price × cu_limit / 1e6；
+//   V1 `priority_fee` 是**总额**（lamports）。故 V0 里所有 `x × 1_000_000 / cu_limit`
+//   的换算在 V1 下**全部去掉**，直接把 lamports 总额塞进 `priority_fee`。
+//
+// 各模式的平台组合与行为与 V0 完全一致，只换构建参数。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// V1 版 [`dispatch`]。`route` / `tip_strategy` / FIFO 语义与 V0 一致。
+pub(crate) async fn dispatch_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    route: SendRoute,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let result = match route {
+        SendRoute::Harmonic => harmonic_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
+        SendRoute::Jito => jito_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
+        SendRoute::Fallback => fallback_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
+        SendRoute::TipOnly => tip_only_auto_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
+    };
+    result.map_err(|e| anyhow::Error::from(e).context("send_v1 failed"))
+}
+
+// ── harmonic_mode_v1 ──────────────────────────────────────────────────────────
+
+/// V1 版 [`harmonic_mode`]。
+///
+/// Harmonic 自己：tip 折算成 `priority_fee`（**V1 下无需除 cu_limit**，priority_fee 本就是总额）。
+/// 其他平台：只有 SOL tip，`priority_fee = None`。
+async fn harmonic_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let V1TxConfig {
+        compute_unit_limit,
+        loaded_accounts_data_size_limit,
+        heap_size,
+        ..
+    } = config;
+    // no_price 那笔：保留 cu 上限相关参数，priority_fee = None
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        compute_unit_limit,
+        loaded_accounts_data_size_limit,
+        heap_size,
+    };
+
+    // AstralaneQuic / Temporal 用 tip_strategy × 0.9
+    let tip_09 = tip_strategy.map(|s| s.scaled(0.9));
+
+    macro_rules! fire_v1_no_price {
+        ($client_opt:expr, tip: $tip:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip($tip, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    cfg_no_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    // Harmonic：tip_strategy → priority_fee（**总额，不除 cu_limit**）
+    #[cfg(feature = "harmonic")]
+    if let Some(c) = &d.harmonic {
+        let tip_lamports = tip_strategy.map(|s| s.compute(0)).unwrap_or(0);
+        // 取 MAX：tip 转换值 vs 调用方原始 priority_fee
+        let priority_fee = tip_lamports.max(config.priority_fee.unwrap_or(0));
+        let harmonic_cfg = V1TxConfig {
+            priority_fee: if priority_fee > 0 { Some(priority_fee) } else { None },
+            compute_unit_limit,
+            loaded_accounts_data_size_limit,
+            heap_size,
+        };
+        // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
+        fire_v1_client(
+            c,
+            ixs,
+            &ctx.payer,
+            None,
+            &ctx.hash_param,
+            harmonic_cfg,
+            Some(&*MEMO_TAG),
+            &mut sigs,
+        );
+    }
+
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_no_price!(d.astralane_quic, tip: tip_09);
+    #[cfg(feature = "temporal")]
+    fire_v1_no_price!(d.temporal, tip: tip_09);
+
+    #[cfg(feature = "everstake_quic")]
+    fire_v1_no_price!(d.everstake_quic, tip: tip_strategy);
+    #[cfg(feature = "everstake")]
+    fire_v1_no_price!(d.everstake, tip: tip_strategy);
+    #[cfg(feature = "flash_block")]
+    fire_v1_no_price!(d.flash_block, tip: tip_strategy);
+    #[cfg(feature = "astralane")]
+    fire_v1_no_price!(d.astralane, tip: tip_strategy);
+    #[cfg(feature = "nodeone")]
+    fire_v1_no_price!(d.nodeone, tip: tip_strategy);
+    #[cfg(feature = "blockrazor")]
+    fire_v1_no_price!(d.blockrazor, tip: tip_strategy);
+    #[cfg(feature = "helius")]
+    fire_v1_no_price!(d.helius_max, tip: tip_strategy);
+    #[cfg(feature = "helius")]
+    fire_v1_no_price!(d.helius_swqos, tip: tip_strategy);
+    #[cfg(feature = "zeroslot")]
+    fire_v1_no_price!(d.zeroslot, tip: tip_strategy);
+    #[cfg(feature = "nextblock")]
+    fire_v1_no_price!(d.nextblock, tip: tip_strategy);
+    #[cfg(feature = "stellium")]
+    fire_v1_no_price!(d.stellium, tip: tip_strategy);
+    #[cfg(feature = "jito")]
+    fire_v1_no_price!(d.jito, tip: tip_strategy);
+
+    log::info!("[harmonic_mode_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── jito_mode_v1 ──────────────────────────────────────────────────────────────
+
+/// V1 版 [`jito_mode`]：只发带 tip 的版本，`priority_fee = None`。
+async fn jito_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        ..config
+    };
+
+    macro_rules! fire_v1_tip_only {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(tip_strategy, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    cfg_no_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_tip_only!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_v1_tip_only!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    fire_v1_tip_only!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    fire_v1_tip_only!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    fire_v1_tip_only!(d.zeroslot);
+    #[cfg(feature = "jito")]
+    fire_v1_tip_only!(d.jito);
+
+    log::info!("[jito_mode_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── fallback_mode_v1 ──────────────────────────────────────────────────────────
+
+/// V1 版 [`fallback_mode`]：平台组合与 tip 语义与 V0 完全一致，
+/// 只把 `cu` 换成 `V1TxConfig`（with_price 那笔用调用方 `priority_fee`，no_price 那笔设 None）。
+async fn fallback_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    // 带 price 那笔：priority_fee 用调用方传入值
+    let cfg_with_price = config;
+    // 纯 tip 那笔：priority_fee = None
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        ..config
+    };
+
+    macro_rules! fire_v1_with_price {
+        ($client_opt:expr, tip: $tip:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip($tip, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    cfg_with_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    macro_rules! fire_v1_both {
+        ($client_opt:expr, with_price: $tip1:expr, no_price: $tip2:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let t1 = opt_tip($tip1, min);
+                let t2 = opt_tip($tip2, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t1,
+                    &ctx.hash_param,
+                    cfg_with_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    t2,
+                    &ctx.hash_param,
+                    cfg_no_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    macro_rules! fire_v1_no_price {
+        ($client_opt:expr, tip: $tip:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip($tip, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    cfg_no_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    #[cfg(feature = "everstake_quic")]
+    fire_v1_with_price!(d.everstake_quic, tip: Some(TipStrategy::Ratio(1.05)));
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_v1_with_price!(d.everstake, tip: Some(TipStrategy::Ratio(1.05)));
+
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_both!(d.astralane_quic,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_v1_both!(d.astralane,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+
+    #[cfg(feature = "flash_block")]
+    fire_v1_both!(d.flash_block,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+
+    #[cfg(feature = "nodeone")]
+    fire_v1_with_price!(d.nodeone, tip: Some(TipStrategy::Ratio(1.05)));
+    #[cfg(feature = "blockrazor")]
+    fire_v1_with_price!(d.blockrazor, tip: Some(TipStrategy::Ratio(1.05)));
+
+    #[cfg(feature = "temporal")]
+    fire_v1_both!(d.temporal,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+
+    #[cfg(feature = "helius")]
+    fire_v1_with_price!(d.helius_max, tip: Some(TipStrategy::Ratio(1.05)));
+    #[cfg(feature = "helius")]
+    fire_v1_with_price!(d.helius_swqos, tip: Some(TipStrategy::Ratio(1.05)));
+
+    #[cfg(feature = "zeroslot")]
+    fire_v1_both!(d.zeroslot,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+
+    #[cfg(feature = "nextblock")]
+    fire_v1_with_price!(d.nextblock, tip: Some(TipStrategy::Ratio(1.05)));
+    #[cfg(feature = "stellium")]
+    fire_v1_with_price!(d.stellium, tip: Some(TipStrategy::Ratio(1.05)));
+
+    #[cfg(feature = "jito")]
+    fire_v1_no_price!(d.jito, tip: tip_strategy);
+
+    log::info!("[fallback_mode_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── tip_only_auto_v1 ──────────────────────────────────────────────────────────
+
+/// V1 版 [`tip_only_auto`]。`priority_fee = 调用方传入值`（不超 0.0001 SOL 上限）。
+async fn tip_only_auto_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    // priority_fee 总额上限 0.0001 SOL（100_000 lamports）
+    let max_fee = 100_000u64;
+    let priority_fee = match config.priority_fee {
+        Some(p) => p.min(max_fee),
+        None => (max_fee as f64 * 0.8) as u64,
+    };
+    let cfg = V1TxConfig {
+        priority_fee: Some(priority_fee),
+        ..config
+    };
+
+    let min_tip_floor = tip_strategy.map(|s| s.compute(0)).unwrap_or(5_000);
+
+    #[cfg(feature = "helius")]
+    if let Some(c) = &d.helius_max {
+        let tip = Some(min_tip_floor.max(c.as_ref().get_min_tip_amount()));
+        fire_v1_client(
+            c,
+            ixs,
+            &ctx.payer,
+            tip,
+            &ctx.hash_param,
+            cfg,
+            Some(&*MEMO_TAG),
+            &mut sigs,
+        );
+    }
+
+    fire_all_parallel_v1(d, ixs, ctx, min_tip_floor, cfg, Some(MEMO_TAG.to_string()), &mut sigs).await;
+    log::info!("[tip_only_auto_v1] priority_fee={priority_fee} fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── dispatch_cheap_v1 ─────────────────────────────────────────────────────────
+
+/// V1 版 [`dispatch_cheap`]：平台组合与 V0 一致。
+pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    tip_strategy: Option<TipStrategy>,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    macro_rules! fire_v1_cheap {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(tip_strategy, min);
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    config,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    #[cfg(feature = "everstake_quic")]
+    fire_v1_cheap!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_v1_cheap!(d.everstake);
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_cheap!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_v1_cheap!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    fire_v1_cheap!(d.flash_block);
+    #[cfg(feature = "jito")]
+    fire_v1_cheap!(d.jito);
+
+    log::info!("[dispatch_cheap_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_cheap_v1 failed: {}", e))
+}
+
+// ── dispatch_tip_only_v1 ──────────────────────────────────────────────────────
+
+/// V1 版 [`dispatch_tip_only`]。
+pub(crate) async fn dispatch_tip_only_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    route: SendRoute,
+    min_tip_floor: u64,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let result = match route {
+        SendRoute::Harmonic => tip_only_harmonic_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
+        SendRoute::Jito => tip_only_jito_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
+        SendRoute::Fallback => tip_only_fallback_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
+        SendRoute::TipOnly => tip_only_fallback_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
+    };
+    result.map_err(|e| anyhow::Error::from(e).context("send_tip_only_v1 failed"))
+}
+
+/// V1 版 [`fire_all_parallel`]：并发 build+sign+send，用 `build_v1_tx`。
+async fn fire_all_parallel_v1(
+    d: &TxDispacher<impl SlotOracle>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    config: V1TxConfig,
+    memo: Option<String>,
+    sigs: &mut HashSet<Signature>,
+) {
+    use sol_tx_send::platform_clients::{BuildV1Tx, SendTx};
+
+    let sigs_shared = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+
+    macro_rules! spawn_fire_v1 {
+        ($client_opt:expr) => {
+            if let Some(c) = &$client_opt {
+                let c = Arc::clone(c);
+                let ixs = ixs.to_vec();
+                let payer = ctx.payer.clone();
+                let tip = Some(min_tip_floor.max(c.get_min_tip_amount()));
+                let hash_param = ctx.hash_param.clone();
+                let config = config;
+                let memo = memo.clone();
+                let sigs = sigs_shared.clone();
+                handles.push(tokio::spawn(async move {
+                    let memo_ref: Option<&str> = memo.as_deref();
+                    let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
+                    match c.build_v1_tx(&ixs, &payer, &tip, &hash_param, config, memo_vec) {
+                        Ok(env) => {
+                            let sig = env.sig();
+                            let tx = env.inner_tx().clone();
+                            log::info!("[par-v1] 🚀 {} sending {}", c, sig);
+                            sigs.lock().unwrap().push(sig);
+                            let sender = Arc::clone(&c);
+                            tokio::spawn(async move {
+                                let _ = sender.send_tx(&tx).await;
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("[par-v1] {} build: {}", c, e);
+                        }
+                    }
+                }));
+            }
+        };
+    }
+
+    #[cfg(feature = "everstake_quic")]
+    spawn_fire_v1!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    spawn_fire_v1!(d.everstake);
+    #[cfg(feature = "astralane_quic")]
+    spawn_fire_v1!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    spawn_fire_v1!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    spawn_fire_v1!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    spawn_fire_v1!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    spawn_fire_v1!(d.zeroslot);
+    #[cfg(feature = "nodeone")]
+    spawn_fire_v1!(d.nodeone);
+    #[cfg(feature = "blockrazor")]
+    spawn_fire_v1!(d.blockrazor);
+    #[cfg(feature = "helius")]
+    spawn_fire_v1!(d.helius_max);
+    #[cfg(feature = "helius")]
+    spawn_fire_v1!(d.helius_swqos);
+    #[cfg(feature = "nextblock")]
+    spawn_fire_v1!(d.nextblock);
+    #[cfg(feature = "stellium")]
+    spawn_fire_v1!(d.stellium);
+
+    for h in handles {
+        let _ = h.await;
+    }
+    for sig in sigs_shared.lock().unwrap().iter() {
+        sigs.insert(*sig);
+    }
+}
+
+/// V1 版 [`tip_only_harmonic`]。
+async fn tip_only_harmonic_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    // Harmonic：tip → priority_fee（**总额，不除 cu_limit**）
+    #[cfg(feature = "harmonic")]
+    if let Some(c) = &d.harmonic {
+        let cfg = V1TxConfig {
+            priority_fee: if min_tip_floor > 0 { Some(min_tip_floor) } else { None },
+            ..config
+        };
+        fire_v1_client(
+            c,
+            ixs,
+            &ctx.payer,
+            None,
+            &ctx.hash_param,
+            cfg,
+            Some(&*MEMO_TAG),
+            &mut sigs,
+        );
+    }
+
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        ..config
+    };
+    fire_all_parallel_v1(
+        d,
+        ixs,
+        ctx,
+        min_tip_floor,
+        cfg_no_price,
+        Some(MEMO_TAG.to_string()),
+        &mut sigs,
+    )
+    .await;
+    log::info!("[tip_only_harmonic_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(harmonic) failed: {}", e))
+}
+
+/// V1 版 [`tip_only_jito`]。
+async fn tip_only_jito_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        ..config
+    };
+
+    macro_rules! fire_v1_tip {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = Some(min_tip_floor.max(min));
+                fire_v1_client(
+                    c,
+                    ixs,
+                    &ctx.payer,
+                    tip,
+                    &ctx.hash_param,
+                    cfg_no_price,
+                    Some(&*MEMO_TAG),
+                    &mut sigs,
+                );
+            }
+        };
+    }
+
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_tip!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_v1_tip!(d.astralane);
+    #[cfg(feature = "flash_block")]
+    fire_v1_tip!(d.flash_block);
+    #[cfg(feature = "temporal")]
+    fire_v1_tip!(d.temporal);
+    #[cfg(feature = "zeroslot")]
+    fire_v1_tip!(d.zeroslot);
+    #[cfg(feature = "jito")]
+    fire_v1_tip!(d.jito);
+
+    log::info!("[tip_only_jito_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(jito) failed: {}", e))
+}
+
+/// V1 版 [`tip_only_fallback`]。
+async fn tip_only_fallback_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    min_tip_floor: u64,
+    config: V1TxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+    let cfg_no_price = V1TxConfig {
+        priority_fee: None,
+        ..config
+    };
+
+    fire_all_parallel_v1(
+        d,
+        ixs,
+        ctx,
+        min_tip_floor,
+        cfg_no_price,
+        Some(MEMO_TAG.to_string()),
+        &mut sigs,
+    )
+    .await;
+    log::info!("[tip_only_fallback_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(fallback) failed: {}", e))
 }

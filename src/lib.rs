@@ -34,7 +34,7 @@ pub use context::{SendContext, merge_alts};
 use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
 use sol_slot_leader::SlotOracle;
-use sol_tx_send::platform_clients::BundleSender;
+use sol_tx_send::platform_clients::{BundleSender, V1TxConfig};
 use std::sync::Arc;
 
 /// 走 tip-only 模式的 leader vote account（只靠 tip 竞价，不参与 cu_price 竞争）
@@ -415,6 +415,142 @@ impl<O: SlotOracle> TxDispacher<O> {
         strategy::dispatch_with_cost(self, ixs, ctx, route, config, confirm_timeout_secs)
             .await
             .map_err(into_tx_confirm_err)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // V1 接口
+    //
+    // 与 V0 一一对应，行为保持不变，只把构建参数换成 V1：
+    //   - `cu: (Option<u32>, Option<u64>)` → `config: V1TxConfig`
+    //   - 无 `alt` 参数（V1 不支持地址查找表，账户全部内联）
+    //
+    // **注意 `priority_fee` 语义**：它是 **lamports 总额**，不是 micro-lamports/CU 单价。
+    // V0 里所有 `tip × 1_000_000 / cu_limit` 的换算在 V1 下都不做。
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// V1 版 [`send`]。路由 / FIFO / tip 语义与 V0 完全一致。
+    pub async fn send_v1(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        tip_strategy: Option<TipStrategy>,
+        config: V1TxConfig,
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        let route = self.resolve_route(target_slot);
+        // FIFO leader：priority_fee=None（不参与竞价），只保留 cu_limit 相关参数
+        if self.is_fifo_leader(target_slot) {
+            log::info!(
+                "[TxDispacher::send_v1] slot={} route={:?} 命中 FIFO leader → tip=None priority_fee=None",
+                target_slot,
+                route
+            );
+            let cfg = V1TxConfig {
+                priority_fee: None,
+                ..config
+            };
+            return strategy::dispatch_v1(self, ixs, ctx, route, None, cfg, confirm_timeout_secs)
+                .await
+                .map_err(into_tx_confirm_err);
+        }
+        log::info!("[TxDispacher::send_v1] slot={} route={:?}", target_slot, route);
+        strategy::dispatch_v1(self, ixs, ctx, route, tip_strategy, config, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
+    /// V1 版 [`send_cheap`]。
+    pub async fn send_cheap_v1(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        tip_strategy: Option<TipStrategy>,
+        config: V1TxConfig,
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
+    /// V1 版 [`send_tip_only`]。
+    pub async fn send_tip_only_v1(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        min_tip_floor: u64,
+        config: V1TxConfig,
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        let route = self.resolve_route(target_slot);
+        log::info!(
+            "[TxDispacher::send_tip_only_v1] slot={} route={:?} tip_floor={}",
+            target_slot,
+            route,
+            min_tip_floor
+        );
+        strategy::dispatch_tip_only_v1(self, ixs, ctx, route, min_tip_floor, config, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
+    /// V1 版 [`send_with_cost`]。单预算 `cost_amount` 全额作为 `priority_fee` 总额。
+    pub async fn send_with_cost_v1(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        target_slot: u64,
+        config: CostConfig,
+        confirm_timeout_secs: u64,
+    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        let route = self.resolve_route(target_slot);
+        let v1_config = V1TxConfig {
+            priority_fee: Some(config.cost_amount),
+            compute_unit_limit: Some(config.cu_limit),
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+        };
+        // FIFO leader：不参与竞价，priority_fee=None
+        if self.is_fifo_leader(target_slot) {
+            log::info!(
+                "[TxDispacher::send_with_cost_v1] slot={} route={:?} 命中 FIFO leader → cost 不生效 priority_fee=None",
+                target_slot,
+                route
+            );
+            let cfg = V1TxConfig {
+                priority_fee: None,
+                ..v1_config
+            };
+            return strategy::dispatch_v1(self, ixs, ctx, route, None, cfg, confirm_timeout_secs)
+                .await
+                .map_err(into_tx_confirm_err);
+        }
+        log::info!(
+            "[TxDispacher::send_with_cost_v1] slot={} route={:?} cost={} cu_limit={}",
+            target_slot,
+            route,
+            config.cost_amount,
+            config.cu_limit
+        );
+        strategy::dispatch_v1(self, ixs, ctx, route, None, v1_config, confirm_timeout_secs)
+            .await
+            .map_err(into_tx_confirm_err)
+    }
+
+    /// V1 版 [`send_flashblock_only`]。只用 FlashBlock 发一笔，fire-and-forget。
+    #[cfg(feature = "flash_block")]
+    pub fn send_flashblock_only_v1(
+        &self,
+        ixs: &[solana_sdk::instruction::Instruction],
+        ctx: &SendContext,
+        config: V1TxConfig,
+    ) -> Option<solana_sdk::signature::Signature> {
+        let client = self.flash_block.as_ref()?;
+        let mut sigs = ahash::AHashSet::new();
+        fire::fire_v1_client(client, ixs, &ctx.payer, None, &ctx.hash_param, config, None, &mut sigs);
+        sigs.into_iter().next()
     }
 }
 
