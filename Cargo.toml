@@ -66,5 +66,3 @@ solana-client = "4.2.2"
 
 [dev-dependencies]
 const-accounts = { git = "https://github.com/miaomiaowu0428/const-accounts.git", branch = "supportV1" }
-
-[workspace]
