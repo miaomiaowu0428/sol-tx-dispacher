@@ -28,7 +28,7 @@ mod fire;
 mod strategy;
 
 pub use builder::TxDispacherBuilder;
-pub use bundle::{MultiBundleError, MultiBundleSender};
+pub use bundle::{MultiBundleError, MultiBundleErrorV1, MultiBundleSender, MultiBundleSenderV1};
 pub use context::{SendContext, merge_alts};
 
 use fifo::FIFO_LEADERS;
@@ -233,6 +233,35 @@ impl<O: SlotOracle> TxDispacher<O> {
             senders.push(Box::new(c.as_ref().clone()));
         }
         MultiBundleSender::new(senders)
+    }
+
+    /// **[`Self::bundle_sender`] 的 V1 版**：同样是多平台并发 bundle，
+    /// 只是每笔交易用 V1 格式构建（`V1TxConfig` 取代 `cu`，无 ALT）。
+    ///
+    /// # 什么时候要用它
+    ///
+    /// V1 只提高**账户数**（64 inline）与**字节数**（4096），**没有**提高单笔能锁的
+    /// 账户上限。所以「migrate + sell」这类指令条数多、去重后仍超 64 个账户的场景，
+    /// 还是必须拆成多笔 bundle —— 只是每笔内部改用 V1 编码。
+    pub fn bundle_sender_v1(&self) -> MultiBundleSenderV1 {
+        let mut senders: Vec<Box<dyn BundleSender>> = Vec::new();
+        #[cfg(feature = "jito")]
+        if let Some(c) = &self.jito {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "astralane")]
+        if let Some(c) = &self.astralane {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "flash_block")]
+        if let Some(c) = &self.flash_block {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        #[cfg(feature = "helius")]
+        if let Some(c) = &self.helius_max {
+            senders.push(Box::new(c.as_ref().clone()));
+        }
+        MultiBundleSenderV1::new(senders)
     }
 
     /// 只用 **FlashBlock** 发一笔（不挑 leader、不参与 tip/cu_price 竞价）。
@@ -549,7 +578,7 @@ impl<O: SlotOracle> TxDispacher<O> {
     ) -> Option<solana_sdk::signature::Signature> {
         let client = self.flash_block.as_ref()?;
         let mut sigs = ahash::AHashSet::new();
-        fire::fire_v1_client(client, ixs, &ctx.payer, None, &ctx.hash_param, config, None, &mut sigs);
+        fire::fire_v1_client(client, ixs, ctx, None, config, None, &mut sigs);
         sigs.into_iter().next()
     }
 }

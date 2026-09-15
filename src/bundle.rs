@@ -30,7 +30,7 @@
 use ahash::AHashSet as HashSet;
 use grpc_client::TransactionFormat;
 use nonce_cache::{TxConfirmError, confirm_success_tx, tx_result_channel};
-use sol_tx_send::platform_clients::{BundleBuilder, BundleError, BundleSender, HashParam};
+use sol_tx_send::platform_clients::{BundleBuilder, BundleBuilderV1, BundleError, BundleSender, HashParam, V1TxConfig};
 use solana_sdk::{
     instruction::Instruction,
     message::AddressLookupTableAccount,
@@ -156,6 +156,135 @@ impl MultiBundleSender {
         if watch_sigs.is_empty() {
             // 没有任何平台成功发出签名 → 归为超时失败
             log::error!("[MultiBundleSender] 所有平台 bundle 发送失败，无签名可监听");
+            return Err(TxConfirmError::Timeout {
+                expected_sigs: vec![],
+                timeout_secs: confirm_timeout_secs,
+            });
+        }
+
+        // 4. 确认：忽略交易失败/Meta 缺失（打日志继续等），只等成功或超时
+        confirm_success_tx(rx, watch_sigs, confirm_timeout_secs).await
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V1 版多平台 bundle 发送器
+//
+// # 什么时候用（V1 并没有让 bundle 失去价值）
+//
+// V1 只提高**账户数**（64 inline）与**字节数**（4096），**没有**提高单笔的
+// 指令/账户上限 —— 一笔交易依旧最多锁 64 个账户。所以「migrate + sell」这种
+// 指令条数多、账户去重后仍超 64 的场景，还是必须拆成多笔 bundle，
+// 只是每笔内部改用 V1 编码。
+//
+// # 与 [`MultiBundleSender`]（V0 版）的差异
+//
+// | | V0 版 | 本类型 |
+// |---|---|---|
+// | `append` 计费参数 | `cu: &(Option<u32>, Option<u64>)` | `config: V1TxConfig` |
+// | `append` 的 ALT | `address_lookup_tables: &[…]` | **无**（V1 不支持查找表） |
+//
+// `send()` / 确认流程与 V0 版**完全一致**（传输层与确认逻辑不区分交易版本）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// V1 版多平台 bundle 发送器（与 [`MultiBundleSender`] 一一对应）。
+pub struct MultiBundleSenderV1 {
+    builders: Vec<BundleBuilderV1>,
+}
+
+/// [`MultiBundleSenderV1::append`] 失败时携带所有保留的 builder。
+pub struct MultiBundleErrorV1 {
+    pub msg: String,
+    pub builders: Vec<BundleBuilderV1>,
+}
+
+impl MultiBundleErrorV1 {
+    pub fn into_builders(self) -> Vec<BundleBuilderV1> {
+        self.builders
+    }
+}
+
+impl MultiBundleSenderV1 {
+    /// 用一组平台 bundle 发送者构造。
+    pub fn new(senders: Vec<Box<dyn BundleSender>>) -> Self {
+        Self {
+            builders: senders.into_iter().map(BundleBuilderV1::new).collect(),
+        }
+    }
+
+    /// 从一组已构建的 builder 恢复（配合 [`MultiBundleErrorV1::into_builders`]）。
+    pub fn from_builders(builders: Vec<BundleBuilderV1>) -> Self {
+        Self { builders }
+    }
+
+    pub fn len(&self) -> usize {
+        self.builders.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.builders.is_empty()
+    }
+
+    /// 给所有平台各添加一笔 **V1** 交易。参数与 [`BundleBuilderV1::append`] 一致。
+    ///
+    /// 链式调用：`multi.append(...)?.append(...)?.send(60).await`
+    pub fn append(
+        mut self,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+        tip: &Option<u64>,
+        nonce: &HashParam,
+        config: V1TxConfig,
+        memo: Option<Vec<&str>>,
+    ) -> Result<Self, MultiBundleErrorV1> {
+        let mut next = Vec::with_capacity(self.builders.len());
+        for b in self.builders {
+            match b.append(ixs, signers, tip, nonce, config, memo.clone()) {
+                Ok(b) => next.push(b),
+                Err(e) => {
+                    let BundleError { msg, builder } = e;
+                    next.push(builder);
+                    return Err(MultiBundleErrorV1 { msg, builders: next });
+                }
+            }
+        }
+        self.builders = next;
+        Ok(self)
+    }
+
+    /// 并发发送所有平台的 bundle，并确认任意一笔上链。
+    ///
+    /// 流程与 [`MultiBundleSender::send`] 逐字相同（传输层不区分交易版本）：
+    /// 订阅 → 并发发送 → 收集全部签名 → 等任一成功或超时。
+    pub async fn send(self, confirm_timeout_secs: u64) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+        // 1. 订阅必须在发送之前
+        let rx = tx_result_channel::subscribe();
+
+        if self.builders.is_empty() {
+            return Err(TxConfirmError::Timeout {
+                expected_sigs: vec![],
+                timeout_secs: confirm_timeout_secs,
+            });
+        }
+
+        // 2. 并发发送所有平台 bundle
+        let mut handles = Vec::with_capacity(self.builders.len());
+        for b in self.builders {
+            handles.push(tokio::spawn(async move { b.send().await }));
+        }
+
+        // 3. 收集每平台 bundle 的【全部】签名；任一平台任一笔确认到即视为成功
+        let mut watch_sigs: HashSet<Signature> = HashSet::new();
+        for h in handles {
+            match h.await {
+                Ok(Ok(sigs)) => {
+                    watch_sigs.extend(sigs);
+                }
+                Ok(Err(e)) => log::error!("[MultiBundleSenderV1] 平台 bundle 发送失败: {e}"),
+                Err(e) => log::error!("[MultiBundleSenderV1] task join error: {e}"),
+            }
+        }
+        if watch_sigs.is_empty() {
+            log::error!("[MultiBundleSenderV1] 所有平台 bundle 发送失败，无签名可监听");
             return Err(TxConfirmError::Timeout {
                 expected_sigs: vec![],
                 timeout_secs: confirm_timeout_secs,

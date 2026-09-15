@@ -13,6 +13,8 @@ use solana_sdk::{
 };
 use std::{fmt::Display, sync::Arc};
 
+use crate::context::SendContext;
+
 /// 对某个平台发起一次 fire-and-forget 发送，将 sig 插入 `sigs`。
 ///
 /// - `tip`：`None` 走平台最低 tip；`Some(0)` 完全不加 tip 指令。
@@ -72,21 +74,25 @@ pub fn fire_client<C>(
 ///
 /// 与 V0 版的差异只在**构建参数**：
 /// - 没有 `cu: (limit, price)` → 改为 `config: V1TxConfig`（CU 上限 + priority fee 等）
-/// - 没有 `alt` → V1 不支持地址查找表，账户全部内联
+/// - **不读 `ctx.alt`** → V1 不支持地址查找表，账户全部内联（故本函数收
+///   [`SendContext`] 只为统一接口风格，ALT 部分被忽略）
 ///
 /// 发送路径完全一致（`SendTx::send_tx` 接收的都是 `VersionedTransaction`）。
 pub fn fire_v1_client<C>(
     client: &Arc<C>,
     ixs: &[Instruction],
-    payer: &Arc<Keypair>,
+    ctx: &SendContext,
     tip: Option<u64>,
-    hash_param: &HashParam,
     config: V1TxConfig,
     memo: Option<&str>,
     sigs: &mut HashSet<Signature>,
 ) where
     C: BuildV1Tx + BuildTx + SendTx + Display + Sync + Send + 'static,
 {
+    // 只取 `payer` / `hash_param`；`ctx.alt` 在 V1 下无意义，忽略。
+    let payer = &ctx.payer;
+    let hash_param = &ctx.hash_param;
+
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
     let build_t0 = std::time::Instant::now();
     let (sig, tx) = {

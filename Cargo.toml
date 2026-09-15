@@ -66,3 +66,4 @@ solana-client = "4.2.2"
 
 [dev-dependencies]
 const-accounts = { git = "https://github.com/miaomiaowu0428/const-accounts.git", branch = "main" }
+async-trait = "0.1.89"
