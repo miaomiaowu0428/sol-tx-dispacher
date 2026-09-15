@@ -53,10 +53,10 @@ jito            = []
 harmonic        = []
 
 [dependencies]
-sol-slot-leader = { git = "https://github.com/miaomiaowu0428/sol-slot-leader.git", branch = "supportV1" }
-sol-tx-send     = { git = "https://github.com/miaomiaowu0428/sol-tx-sender.git", branch = "supportV1" }
-nonce_cache     = { git = "https://github.com/miaomiaowu0428/nonce_cache.git", branch = "supportV1" }
-grpc-client     = { git = "https://github.com/miaomiaowu0428/grpc-client.git", branch = "supportV1" }
+sol-slot-leader = { git = "https://github.com/miaomiaowu0428/sol-slot-leader.git", branch = "main" }
+sol-tx-send     = { git = "https://github.com/miaomiaowu0428/sol-tx-sender.git", branch = "main" }
+nonce_cache     = { git = "https://github.com/miaomiaowu0428/nonce_cache.git", branch = "main" }
+grpc-client     = { git = "https://github.com/miaomiaowu0428/grpc-client.git", branch = "main" }
 tokio           = { version = "1", features = ["full"] }
 log             = "0.4"
 anyhow          = "1"
@@ -65,4 +65,4 @@ solana-sdk = "4.0.0"
 solana-client = "4.2.2"
 
 [dev-dependencies]
-const-accounts = { git = "https://github.com/miaomiaowu0428/const-accounts.git", branch = "supportV1" }
+const-accounts = { git = "https://github.com/miaomiaowu0428/const-accounts.git", branch = "main" }
