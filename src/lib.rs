@@ -538,8 +538,10 @@ impl<O: SlotOracle> TxDispacher<O> {
         let v1_config = V1TxConfig {
             priority_fee: Some(config.cost_amount),
             compute_unit_limit: Some(config.cu_limit),
-            loaded_accounts_data_size_limit: None,
-            heap_size: None,
+            // ⚠️ 必须走 `Default`：V1 下 `loaded_accounts_data_size_limit` / `heap_size`
+            //    若为 `None`，链上按 0 处理 → 交易直接失败（gas 白烧）。
+            //    `Default` 给的是 64 MiB / 32 KB。
+            ..Default::default()
         };
         // FIFO leader：不参与竞价，priority_fee=None
         if self.is_fifo_leader(target_slot) {
