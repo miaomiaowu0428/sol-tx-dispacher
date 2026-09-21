@@ -187,6 +187,225 @@ impl CostTxConfig {
     }
 }
 
+/// 默认「带 price 那笔」的 tip 倍率（相对平台最低 tip）。
+///
+/// 1.05 = 比平台最低价高 5%：保证带 `priority_fee` 的那笔不被平台以 tip 不足丢弃，
+/// 又不至于浪费。与 V0 `fallback_mode` 里写死的 `Ratio(1.05)` 一致。
+pub const DEFAULT_TIP_RATE: f64 = 1.05;
+
+// ── SpendMode / SpendConfig ───────────────────────────────────────────────────
+
+/// **V1 发送的竞价模式** —— 明确区分「我只要这个 tip」和「我总共花这么多」。
+///
+/// 这两种语义**不可混用**，所以在类型层面分开：
+///
+/// | 变体 | 含义 | 底层接口 |
+/// |---|---|---|
+/// | [`SpendMode::FixedTip`] | 「tip = 这个值」，gas 由 `cu_limit` 另算 | [`TxDispacher::send_tip_only_v1`] |
+/// | [`SpendMode::Cost`] | 「这笔总共花这么多」，落地通道由平台性质决定 | [`TxDispacher::send_with_cost_v1`] |
+///
+/// # 为什么需要区分
+///
+/// 历史上有调用方把两者混着设（`tip = X` + `gas = Y`），导致：
+///
+/// - 换计价腿 / 换 CU 上限时 tip 与 gas 的配比悄悄失衡
+/// - 无法表达「不要 tip」（只能靠传 `None`，容易被误当默认值）
+///
+/// 拆成 enum 后，每个调用点**必须显式选一种**，语义不会再混。
+#[derive(Debug, Clone, Copy)]
+pub enum SpendMode {
+    /// **固定 tip**：`tip` 原样交给底层，`priority_fee = None`。
+    ///
+    /// - `None` = **不给 tip**（平台默认，等价 V0 的 `tip = None`）
+    /// - `Some(n)` = 精确 `n` lamports（`n` 可为 `0`）
+    FixedTip(Option<u64>),
+
+    /// **单笔竞价总预算（lamports）**：落地为 tip 还是 `priority_fee` 由平台性质决定。
+    ///
+    /// 走 cost 语义（V0 `send_with_cost` 的 V1 对应物）。
+    Cost(u64),
+}
+
+impl SpendMode {
+    /// 便捷：精确 tip。
+    pub const fn tip(n: u64) -> Self {
+        Self::FixedTip(Some(n))
+    }
+
+    /// 便捷：不给 tip（平台默认）。
+    pub const fn no_tip() -> Self {
+        Self::FixedTip(None)
+    }
+
+    /// 便捷：单笔总预算。
+    pub const fn cost(n: u64) -> Self {
+        Self::Cost(n)
+    }
+}
+
+/// **V1 发送配置** —— 统一入口 [`TxDispacher::send`] 的唯一入参。
+///
+/// 把「竞价意图」（[`SpendMode`]）与「构建参数」（`cu_limit` / 账户数据上限 / heap）
+/// 收在一个类型里，避免调用方各自拼 `tip_strategy` + `V1TxConfig` 时
+/// **把两种语义混起来**。
+///
+/// # 用法
+///
+/// ```ignore
+/// // 固定 tip
+/// dispacher().send(ixs, ctx, slot, SpendConfig::tip(1_000_000, 135_000), 60).await;
+///
+/// // 不给 tip（平台默认）
+/// dispacher().send(ixs, ctx, slot, SpendConfig::no_tip(135_000), 60).await;
+///
+/// // 单笔总预算
+/// dispacher().send(ixs, ctx, slot, SpendConfig::cost(170_000_000, 135_000), 60).await;
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct SpendConfig {
+    /// 竞价模式。
+    pub mode: SpendMode,
+    /// compute units 上限。
+    pub cu_limit: u32,
+    /// 最大可加载账户数据字节数。`None` = 走 [`V1TxConfig::default()`]（64 MiB）。
+    pub loaded_accounts_data_size_limit: Option<u32>,
+    /// 堆大小（字节）。`None` = 走 [`V1TxConfig::default()`]（32 KB）。
+    pub heap_size: Option<u32>,
+    /// 「带 price 那笔」的 tip 倍率（相对平台最低 tip）。
+    ///
+    /// 仅 [`SpendMode::Cost`] 有意义：保证带 `priority_fee` 的那笔
+    /// 不致因 tip 不足被平台丢弃，又不过度抬高。
+    /// 默认 [`DEFAULT_TIP_RATE`]。
+    pub tip_rate: f64,
+}
+
+impl SpendConfig {
+    /// 通用构造。
+    pub fn new(mode: SpendMode, cu_limit: u32) -> Self {
+        Self {
+            mode,
+            cu_limit,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+            tip_rate: DEFAULT_TIP_RATE,
+        }
+    }
+
+    /// 便捷：固定 tip（`None` = 平台默认）。
+    pub fn fixed_tip(tip: Option<u64>, cu_limit: u32) -> Self {
+        Self::new(SpendMode::FixedTip(tip), cu_limit)
+    }
+
+    /// 便捷：精确 tip。
+    pub fn tip(n: u64, cu_limit: u32) -> Self {
+        Self::new(SpendMode::tip(n), cu_limit)
+    }
+
+    /// 便捷：不给 tip。
+    pub fn no_tip(cu_limit: u32) -> Self {
+        Self::new(SpendMode::no_tip(), cu_limit)
+    }
+
+    /// 便捷：单笔总预算。
+    pub fn cost(n: u64, cu_limit: u32) -> Self {
+        Self::new(SpendMode::cost(n), cu_limit)
+    }
+
+    /// 覆盖 `cu_limit`。
+    pub fn with_cu_limit(mut self, cu_limit: u32) -> Self {
+        self.cu_limit = cu_limit;
+        self
+    }
+
+    /// 覆盖账户数据上限。
+    pub fn with_loaded_accounts_data_size_limit(mut self, limit: u32) -> Self {
+        self.loaded_accounts_data_size_limit = Some(limit);
+        self
+    }
+
+    /// 覆盖 `tip_rate`（仅 [`SpendMode::Cost`] 有意义）。
+    ///
+    /// 控制「带 price 那笔」的 tip 倍率（相对平台最低 tip）。
+    pub fn with_tip_rate(mut self, tip_rate: f64) -> Self {
+        self.tip_rate = tip_rate;
+        self
+    }
+
+    /// 覆盖堆大小。
+    pub fn with_heap_size(mut self, size: u32) -> Self {
+        self.heap_size = Some(size);
+        self
+    }
+
+    /// **仅给 tip 值**的 `V1TxConfig`（`priority_fee = None`）。
+    ///
+    /// 用于「走 SOL tip 竞价」的通道。⚠️ **必须走 `..Default::default()`**：
+    /// V1 下 `loaded_accounts_data_size_limit` / `heap_size` 若为 `None`，
+    /// 链上按 0 处理 → 交易直接失败（gas 白烧）。
+    pub fn as_tip_config(&self) -> sol_tx_send::platform_clients::V1TxConfig {
+        sol_tx_send::platform_clients::V1TxConfig {
+            priority_fee: None,
+            compute_unit_limit: Some(self.cu_limit),
+            ..self.defaults()
+        }
+    }
+
+    /// **把 `cost` 落地为 `priority_fee`** 的 `V1TxConfig`。
+    ///
+    /// ⚠️ 只有 [`SpendMode::Cost`] 有意义；`FixedTip` 时 `priority_fee = None`。
+    pub fn as_fee_config(&self) -> sol_tx_send::platform_clients::V1TxConfig {
+        sol_tx_send::platform_clients::V1TxConfig {
+            priority_fee: self.cost_opt(),
+            compute_unit_limit: Some(self.cu_limit),
+            ..self.defaults()
+        }
+    }
+
+    /// 转成 [`TipStrategy`]（仅 [`SpendMode::FixedTip`] 有意义）。
+    ///
+    /// - `FixedTip(None)` → `None`（平台默认）
+    /// - `FixedTip(Some(n))` → `Some(Absolute(n))`
+    /// - `Cost(_)` → `None`（cost 模式的 tip 由 cost 语义自行推）
+    pub fn as_tip_strategy(&self) -> Option<TipStrategy> {
+        match self.mode {
+            SpendMode::FixedTip(Some(n)) => Some(TipStrategy::Absolute(n)),
+            SpendMode::FixedTip(None) | SpendMode::Cost(_) => None,
+        }
+    }
+
+    /// `cost` 值（仅 [`SpendMode::Cost`] 有）。
+    pub fn cost_opt(&self) -> Option<u64> {
+        match self.mode {
+            SpendMode::Cost(n) => Some(n),
+            SpendMode::FixedTip(_) => None,
+        }
+    }
+
+    /// 组装 `V1TxConfig` 的「账户数据上限 / heap」部分（都走 `Default` 兜底）。
+    fn defaults(&self) -> sol_tx_send::platform_clients::V1TxConfig {
+        let d = sol_tx_send::platform_clients::V1TxConfig::default();
+        sol_tx_send::platform_clients::V1TxConfig {
+            priority_fee: None,
+            compute_unit_limit: None,
+            loaded_accounts_data_size_limit: Some(
+                self.loaded_accounts_data_size_limit
+                    .or(d.loaded_accounts_data_size_limit)
+                    .unwrap_or(64 * 1024 * 1024),
+            ),
+            heap_size: self.heap_size.or(d.heap_size),
+        }
+    }
+
+    /// 转成旧的 [`CostTxConfig`]（供 cost 语义的内部实现使用）。
+    pub fn as_cost_tx_config(&self) -> CostTxConfig {
+        CostTxConfig {
+            cost: self.cost_opt().unwrap_or(0),
+            cu_limit: self.cu_limit,
+            tip_rate: self.tip_rate,
+        }
+    }
+}
+
 // ── feature-gated 平台客户端导入 ──────────────────────────────────────────────
 
 #[cfg(feature = "astralane")]
@@ -535,38 +754,6 @@ impl<O: SlotOracle> TxDispacher<O> {
     // V0 里所有 `tip × 1_000_000 / cu_limit` 的换算在 V1 下都不做。
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// V1 版 [`send`]。路由 / FIFO / tip 语义与 V0 完全一致。
-    pub async fn send_v1(
-        &self,
-        ixs: &[solana_sdk::instruction::Instruction],
-        ctx: &SendContext,
-        target_slot: u64,
-        tip_strategy: Option<TipStrategy>,
-        config: V1TxConfig,
-        confirm_timeout_secs: u64,
-    ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
-        // FIFO leader：priority_fee=None（不参与竞价），只保留 cu_limit 相关参数
-        if self.is_fifo_leader(target_slot) {
-            log::info!(
-                "[TxDispacher::send_v1] slot={} route={:?} 命中 FIFO leader → tip=None priority_fee=None",
-                target_slot,
-                route
-            );
-            let cfg = V1TxConfig {
-                priority_fee: None,
-                ..config
-            };
-            return strategy::dispatch_v1(self, ixs, ctx, route, None, cfg, confirm_timeout_secs)
-                .await
-                .map_err(into_tx_confirm_err);
-        }
-        log::info!("[TxDispacher::send_v1] slot={} route={:?}", target_slot, route);
-        strategy::dispatch_v1(self, ixs, ctx, route, tip_strategy, config, confirm_timeout_secs)
-            .await
-            .map_err(into_tx_confirm_err)
-    }
-
     /// V1 版 [`send_cheap`]。
     pub async fn send_cheap_v1(
         &self,
@@ -581,45 +768,67 @@ impl<O: SlotOracle> TxDispacher<O> {
             .map_err(into_tx_confirm_err)
     }
 
-    /// V1 版 [`send_tip_only`]。
-    pub async fn send_tip_only_v1(
+    /// **V1 统一发送入口** —— V1 侧唯一对外 API（与 V0 的 [`Self::send`] 对称）。
+    ///
+    /// 按 [`SpendConfig::mode`] 分派：
+    ///
+    /// | 模式 | 行为 | tip 语义 |
+    /// |---|---|---|
+    /// | [`SpendMode::FixedTip`] | 走 `dispatch_v1` | `None` → 平台默认；`Some(n)` → 精确 n |
+    /// | [`SpendMode::Cost`] | 走 `dispatch_with_cost_v1` | 落地通道由平台性质决定 |
+    ///
+    /// 两条路径**都**做 FIFO leader 判断与路由。
+    ///
+    /// ⚠️ `FixedTip` **不走 tip-only 路径**：那条会把 tip 当 `min_tip_floor`
+    /// 并强制抬到平台最低价（`Some`），无法表达「不给 tip」（V0 的 `tip = None`）。
+    pub async fn send_v1(
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
         ctx: &SendContext,
         target_slot: u64,
-        min_tip_floor: u64,
-        config: V1TxConfig,
+        cfg: SpendConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
-        log::info!(
-            "[TxDispacher::send_tip_only_v1] slot={} route={:?} tip_floor={}",
-            target_slot,
-            route,
-            min_tip_floor
-        );
-        strategy::dispatch_tip_only_v1(self, ixs, ctx, route, min_tip_floor, config, confirm_timeout_secs)
-            .await
-            .map_err(into_tx_confirm_err)
+        match cfg.mode {
+            SpendMode::FixedTip(_) => {
+                let tip_strategy = cfg.as_tip_strategy();
+                // FIFO leader：不参与竞价（tip=None），只保留 cu_limit 等构建参数
+                let is_fifo = self.is_fifo_leader(target_slot);
+                if is_fifo {
+                    log::info!(
+                        "[TxDispacher::send_v1] slot={} route={route:?} 命中 FIFO leader → tip=None",
+                        target_slot
+                    );
+                }
+                strategy::dispatch_v1(
+                    self,
+                    ixs,
+                    ctx,
+                    route,
+                    if is_fifo { None } else { tip_strategy },
+                    cfg.as_tip_config(),
+                    confirm_timeout_secs,
+                )
+                .await
+                .map_err(into_tx_confirm_err)
+            }
+            SpendMode::Cost(cost) => {
+                log::info!(
+                    "[TxDispacher::send_v1] slot={} route={route:?} mode=Cost cost={cost} cu_limit={}",
+                    target_slot,
+                    cfg.cu_limit
+                );
+                self.send_with_cost_v1(ixs, ctx, target_slot, cfg.as_cost_tx_config(), confirm_timeout_secs)
+                    .await
+            }
+        }
     }
 
-    /// V1 版 [`send_with_cost`] —— **单预算 `cost`，由各 mode 决定落地通道**。
+    /// V1 版 cost 语义发送（**内部用**，外部统一走 [`Self::send_v1`]）。
     ///
-    /// # 与 V0 的对应关系
-    ///
-    /// 语义与 V0 [`send_with_cost`] 完全一致，只是把「`cu_price` 换算」换成
-    /// 「`priority_fee` 直给」（两者数学等价）：
-    ///
-    /// | V0 | V1 |
-    /// |---|---|
-    /// | `cu_price = cost × 1e6 / cu_limit` | `priority_fee = cost` |
-    /// | `tip = Absolute(cost)`（纯 tip 笔） | 同 |
-    /// | `tip = Ratio(tip_rate)`（带 price 笔保底） | 同 |
-    ///
-    /// ⚠️ **不再**只把 `cost` 一刀切塞进 `priority_fee` —— 那是丢失语义的做法
-    /// （`tip_rate` 无处安放、纯 tip 平台拿不到 tip）。落地由
-    /// [`strategy::dispatch_with_cost_v1`] 按 route 分派给各 `*_cost_mode_v1` 决定。
-    pub async fn send_with_cost_v1(
+    /// 单预算 `cost`，按 route 分派到各 `*_cost_mode_v1`，由后者决定落地通道。
+    pub(crate) async fn send_with_cost_v1(
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
         ctx: &SendContext,

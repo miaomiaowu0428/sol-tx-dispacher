@@ -111,17 +111,6 @@ fn opt_tip(strategy: Option<TipStrategy>, platform_min: u64) -> Option<u64> {
     strategy.map(|s| s.compute(platform_min).max(floor))
 }
 
-/// 带默认比例的 tip 计算：`None` 时用 `default_ratio × platform_min`。
-/// 最终值同样不低于 `platform_min × 1.02`。
-#[inline]
-fn tip_or_default(strategy: Option<TipStrategy>, platform_min: u64, default_ratio: f64) -> Option<u64> {
-    let floor = (platform_min as f64 * 1.02) as u64;
-    Some(match strategy {
-        Some(s) => s.compute(platform_min).max(floor),
-        None => ((platform_min as f64 * default_ratio) as u64).max(floor),
-    })
-}
-
 // ── harmonic_mode ─────────────────────────────────────────────────────────────
 
 async fn harmonic_mode<O: SlotOracle>(
@@ -889,39 +878,6 @@ async fn fire_all_parallel(
     }
 }
 
-// ── 辅助宏：全平台 fire（harmonic 和 jito-only 之外的所有平台） ───────────
-
-macro_rules! fire_all_tip_platforms {
-    ($d:expr, $fire:ident) => {
-        #[cfg(feature = "everstake_quic")]
-        $fire!($d.everstake_quic);
-        #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
-        $fire!($d.everstake);
-        #[cfg(feature = "astralane_quic")]
-        $fire!($d.astralane_quic);
-        #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
-        $fire!($d.astralane);
-        #[cfg(feature = "flash_block")]
-        $fire!($d.flash_block);
-        #[cfg(feature = "temporal")]
-        $fire!($d.temporal);
-        #[cfg(feature = "zeroslot")]
-        $fire!($d.zeroslot);
-        #[cfg(feature = "nodeone")]
-        $fire!($d.nodeone);
-        #[cfg(feature = "blockrazor")]
-        $fire!($d.blockrazor);
-        #[cfg(feature = "helius")]
-        $fire!($d.helius_max);
-        #[cfg(feature = "helius")]
-        $fire!($d.helius_swqos);
-        #[cfg(feature = "nextblock")]
-        $fire!($d.nextblock);
-        #[cfg(feature = "stellium")]
-        $fire!($d.stellium);
-    };
-}
-
 /// Harmonic 出块：发 Harmonic + 全平台 tip-only（不加 cu_price）。
 /// Harmonic 的 tip 会被内部转为 cu_price 竞价。
 async fn tip_only_harmonic<O: SlotOracle>(
@@ -1679,77 +1635,7 @@ async fn tip_only_auto_v1<O: SlotOracle>(
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
-// ── dispatch_cheap_v1 ─────────────────────────────────────────────────────────
-
-/// V1 版 [`dispatch_cheap`]：平台组合与 V0 一致。
-pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
-    d: &TxDispacher<O>,
-    ixs: &[Instruction],
-    ctx: &SendContext,
-    tip_strategy: Option<TipStrategy>,
-    config: V1TxConfig,
-    timeout_secs: u64,
-) -> anyhow::Result<(Signature, TransactionFormat)> {
-    let rx = tx_result_channel::subscribe();
-    let mut sigs = HashSet::new();
-
-    macro_rules! fire_v1_cheap {
-        ($client_opt:expr $(,)?) => {
-            if let Some(c) = &$client_opt {
-                let min = c.as_ref().get_min_tip_amount();
-                let tip = opt_tip(tip_strategy, min);
-                fire_v1_client(
-                    c,
-                    ixs,
-                    ctx,
-                    tip,
-                    config,
-                    Some(&*MEMO_TAG),
-                    &mut sigs,
-                );
-            }
-        };
-    }
-
-    #[cfg(feature = "everstake_quic")]
-    fire_v1_cheap!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
-    fire_v1_cheap!(d.everstake);
-    #[cfg(feature = "astralane_quic")]
-    fire_v1_cheap!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
-    fire_v1_cheap!(d.astralane);
-    #[cfg(feature = "flash_block")]
-    fire_v1_cheap!(d.flash_block);
-    #[cfg(feature = "jito")]
-    fire_v1_cheap!(d.jito);
-
-    log::info!("[dispatch_cheap_v1] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs)
-        .await
-        .map_err(|e| anyhow::anyhow!("send_cheap_v1 failed: {}", e))
-}
-
-// ── dispatch_tip_only_v1 ──────────────────────────────────────────────────────
-
-/// V1 版 [`dispatch_tip_only`]。
-pub(crate) async fn dispatch_tip_only_v1<O: SlotOracle>(
-    d: &TxDispacher<O>,
-    ixs: &[Instruction],
-    ctx: &SendContext,
-    route: SendRoute,
-    min_tip_floor: u64,
-    config: V1TxConfig,
-    timeout_secs: u64,
-) -> anyhow::Result<(Signature, TransactionFormat)> {
-    let result = match route {
-        SendRoute::Harmonic => tip_only_harmonic_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
-        SendRoute::Jito => tip_only_jito_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
-        SendRoute::Fallback => tip_only_fallback_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
-        SendRoute::TipOnly => tip_only_fallback_v1(d, ixs, ctx, min_tip_floor, config, timeout_secs).await,
-    };
-    result.map_err(|e| anyhow::Error::from(e).context("send_tip_only_v1 failed"))
-}
+// ── fire_all_parallel_v1 ──────────────────────────────────────────────────────
 
 /// V1 版 [`fire_all_parallel`]：并发 build+sign+send，用 `build_v1_tx`。
 async fn fire_all_parallel_v1(
@@ -1835,83 +1721,31 @@ async fn fire_all_parallel_v1(
     }
 }
 
-/// V1 版 [`tip_only_harmonic`]。
-async fn tip_only_harmonic_v1<O: SlotOracle>(
+// ── dispatch_cheap_v1 ─────────────────────────────────────────────────────────
+
+/// V1 版 [`dispatch_cheap`]：平台组合与 V0 一致。
+pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
     d: &TxDispacher<O>,
     ixs: &[Instruction],
     ctx: &SendContext,
-    min_tip_floor: u64,
+    tip_strategy: Option<TipStrategy>,
     config: V1TxConfig,
     timeout_secs: u64,
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
 
-    // Harmonic：tip → priority_fee（**总额，不除 cu_limit**）
-    #[cfg(feature = "harmonic")]
-    if let Some(c) = &d.harmonic {
-        let cfg = V1TxConfig {
-            priority_fee: if min_tip_floor > 0 { Some(min_tip_floor) } else { None },
-            ..config
-        };
-        fire_v1_client(
-            c,
-            ixs,
-            ctx,
-            None,
-            cfg,
-            Some(&*MEMO_TAG),
-            &mut sigs,
-        );
-    }
-
-    let cfg_no_price = V1TxConfig {
-        priority_fee: None,
-        ..config
-    };
-    fire_all_parallel_v1(
-        d,
-        ixs,
-        ctx,
-        min_tip_floor,
-        cfg_no_price,
-        Some(MEMO_TAG.to_string()),
-        &mut sigs,
-    )
-    .await;
-    log::info!("[tip_only_harmonic_v1] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs)
-        .await
-        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(harmonic) failed: {}", e))
-}
-
-/// V1 版 [`tip_only_jito`]。
-async fn tip_only_jito_v1<O: SlotOracle>(
-    d: &TxDispacher<O>,
-    ixs: &[Instruction],
-    ctx: &SendContext,
-    min_tip_floor: u64,
-    config: V1TxConfig,
-    timeout_secs: u64,
-) -> anyhow::Result<(Signature, TransactionFormat)> {
-    let rx = tx_result_channel::subscribe();
-    let mut sigs = HashSet::new();
-    let cfg_no_price = V1TxConfig {
-        priority_fee: None,
-        ..config
-    };
-
-    macro_rules! fire_v1_tip {
+    macro_rules! fire_v1_cheap {
         ($client_opt:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let tip = Some(min_tip_floor.max(min));
+                let tip = opt_tip(tip_strategy, min);
                 fire_v1_client(
                     c,
                     ixs,
                     ctx,
                     tip,
-                    cfg_no_price,
+                    config,
                     Some(&*MEMO_TAG),
                     &mut sigs,
                 );
@@ -1919,53 +1753,22 @@ async fn tip_only_jito_v1<O: SlotOracle>(
         };
     }
 
+    #[cfg(feature = "everstake_quic")]
+    fire_v1_cheap!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_v1_cheap!(d.everstake);
     #[cfg(feature = "astralane_quic")]
-    fire_v1_tip!(d.astralane_quic);
+    fire_v1_cheap!(d.astralane_quic);
     #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
-    fire_v1_tip!(d.astralane);
+    fire_v1_cheap!(d.astralane);
     #[cfg(feature = "flash_block")]
-    fire_v1_tip!(d.flash_block);
-    #[cfg(feature = "temporal")]
-    fire_v1_tip!(d.temporal);
-    #[cfg(feature = "zeroslot")]
-    fire_v1_tip!(d.zeroslot);
+    fire_v1_cheap!(d.flash_block);
     #[cfg(feature = "jito")]
-    fire_v1_tip!(d.jito);
+    fire_v1_cheap!(d.jito);
 
-    log::info!("[tip_only_jito_v1] fired {} tx(s)", sigs.len());
+    log::info!("[dispatch_cheap_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
-        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(jito) failed: {}", e))
+        .map_err(|e| anyhow::anyhow!("send_cheap_v1 failed: {}", e))
 }
 
-/// V1 版 [`tip_only_fallback`]。
-async fn tip_only_fallback_v1<O: SlotOracle>(
-    d: &TxDispacher<O>,
-    ixs: &[Instruction],
-    ctx: &SendContext,
-    min_tip_floor: u64,
-    config: V1TxConfig,
-    timeout_secs: u64,
-) -> anyhow::Result<(Signature, TransactionFormat)> {
-    let rx = tx_result_channel::subscribe();
-    let mut sigs = HashSet::new();
-    let cfg_no_price = V1TxConfig {
-        priority_fee: None,
-        ..config
-    };
-
-    fire_all_parallel_v1(
-        d,
-        ixs,
-        ctx,
-        min_tip_floor,
-        cfg_no_price,
-        Some(MEMO_TAG.to_string()),
-        &mut sigs,
-    )
-    .await;
-    log::info!("[tip_only_fallback_v1] fired {} tx(s)", sigs.len());
-    confirm_tx(rx, sigs, timeout_secs)
-        .await
-        .map_err(|e| anyhow::anyhow!("send_tip_only_v1(fallback) failed: {}", e))
-}
