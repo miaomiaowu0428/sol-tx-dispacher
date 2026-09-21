@@ -4,7 +4,7 @@
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
 
 use crate::{
-    CostConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client, fire::fire_v1_client,
+    CostConfig, CostTxConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client, fire::fire_v1_client,
 };
 use ahash::AHashSet as HashSet;
 use grpc_client::TransactionFormat;
@@ -1093,6 +1093,42 @@ pub(crate) async fn dispatch_v1<O: SlotOracle>(
     result.map_err(|e| anyhow::Error::from(e).context("send_v1 failed"))
 }
 
+// ── dispatch_with_cost_v1 ─────────────────────────────────────────────────────
+
+/// V1 版 [`dispatch_with_cost`] —— **单预算 `cost`，由各 mode 决定落地通道**。
+///
+/// 与 [`dispatch_v1`] 的分工：
+///
+/// - `dispatch_v1`：调用方**已经决定**了落地形式（`tip_strategy` + `config.priority_fee`）
+/// - 本函数：调用方只给**意图**（`CostTxConfig.cost`），**落地由各 mode 按平台性质决定**
+///
+/// # 为什么不能只转接给 `dispatch_v1`
+///
+/// `dispatch_v1` 只接受**一个** `V1TxConfig`，而 cost 语义在 Fallback 下需要
+/// **两套 config**（带 price 笔 `priority_fee=cost`、纯 tip 笔 `priority_fee=None`）
+/// **加两个 tip 值**（带 price 笔 `Ratio(tip_rate)`、纯 tip 笔 `Absolute(cost)`）。
+/// 这是 V0 `dispatch_with_cost` 早就解决的问题，V1 照搬同样的结构。
+///
+/// 与 V0 的差异：V0 用 `cu_price = cost × 1e6 / cu_limit`，V1 直接
+/// `priority_fee = cost`（两者数学等价：`priority_fee = cu_price × cu_limit / 1e6`）。
+pub(crate) async fn dispatch_with_cost_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    route: SendRoute,
+    config: CostTxConfig,
+    timeout_secs: u64,
+) -> anyhow::Result<(Signature, TransactionFormat)> {
+    let result = match route {
+        SendRoute::Harmonic => harmonic_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
+        SendRoute::Jito => jito_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
+        SendRoute::TipOnly => tip_only_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
+        // Fallback 是**兜底**：路由没命中具体出块源时走这条，需要双发（with_price + 纯 tip）。
+        SendRoute::Fallback => fallback_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
+    };
+    result.map_err(|e| anyhow::Error::from(e).context("send_with_cost_v1 failed"))
+}
+
 // ── harmonic_mode_v1 ──────────────────────────────────────────────────────────
 
 /// V1 版 [`harmonic_mode`]。
@@ -1397,8 +1433,208 @@ async fn fallback_mode_v1<O: SlotOracle>(
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
-// ── tip_only_auto_v1 ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// V1 cost 语义（单预算，由各 mode 决定落地通道）
+//
+// 与上面 `*_mode_v1` 的**唯一区别**：
+//   `*_mode_v1`  ：调用方已决定落地形式（tip_strategy + config.priority_fee）
+//   `*_cost_mode_v1`：调用方只给意图（CostTxConfig.cost），落地由本函数决定
+//
+// 各平台落地规则（与 V0 `dispatch_with_cost` / `fallback_cost_mode` 一致）：
+//   · Harmonic        → priority_fee = cost（它本就是 gas 竞价，不生成 SOL 转账）
+//   · Jito / TipOnly  → tip = Absolute(cost)（这些平台靠 SOL tip 排序）
+//   · Fallback 带price笔 → priority_fee = cost + tip = Ratio(tip_rate) 保底
+//   · Fallback 纯tip笔   → tip = Absolute(cost)
+// ══════════════════════════════════════════════════════════════════════════════
 
+/// Harmonic 出块的 cost 语义版：`cost → priority_fee`。
+///
+/// Harmonic 的 `uses_tip_transfer()=false`（竞价 = priority fee），所以 `cost`
+/// **全额落成 `priority_fee`**，不生成 SOL 转账。其余平台 `priority_fee=None`，`cost → tip`。
+///
+/// 对应 V0 [`dispatch_with_cost`] 的 `SendRoute::Harmonic` 分支
+/// （那里传 `Absolute(cost)` 作 tip，由 `harmonic_mode` 内部转成 cu_price）。
+async fn harmonic_cost_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    config: CostTxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    // cost 落地到 tip 通道（FireBlock 等平台靠 SOL tip）；Harmonic 内部会把它转 priority_fee
+    harmonic_mode_v1(
+        d,
+        ixs,
+        ctx,
+        Some(TipStrategy::Absolute(config.cost)),
+        config.as_tip_channel_config(),
+        timeout_secs,
+    )
+    .await
+}
+
+/// Jito 出块的 cost 语义版：`cost → tip`（全额）。
+///
+/// Jito 靠 SOL tip 排序，`priority_fee` 对排序无帮助，故 `cost` 全落 tip。
+///
+/// 对应 V0 [`dispatch_with_cost`] 的 `SendRoute::Jito` 分支。
+async fn jito_cost_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    config: CostTxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    jito_mode_v1(
+        d,
+        ixs,
+        ctx,
+        Some(TipStrategy::Absolute(config.cost)),
+        config.as_tip_channel_config(),
+        timeout_secs,
+    )
+    .await
+}
+
+/// TipOnly 出块的 cost 语义版：`cost → tip`（全额）。
+///
+/// 对应 V0 [`dispatch_with_cost`] 的 `SendRoute::TipOnly` 分支。
+///
+/// ⚠️ `tip_only_auto_v1` 内部有 `priority_fee ≤ 100_000` 的硬上限
+/// （见该函数），`cost` 若超过会被 clamp —— 这是 V0 就有的行为，保持一致。
+async fn tip_only_cost_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    config: CostTxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    tip_only_auto_v1(
+        d,
+        ixs,
+        ctx,
+        Some(TipStrategy::Absolute(config.cost)),
+        config.as_tip_channel_config(),
+        timeout_secs,
+    )
+    .await
+}
+
+/// Fallback 出块的 cost 语义版 —— **双发**，显式区分两个通道。
+///
+/// 与 [`fallback_mode_v1`] 结构一致，但 tip / fee 的取值来自 cost 语义：
+///
+/// - **带 price 那笔**（`fire_v1_with_price!` / `fire_v1_both!` 的 with_price 笔）：
+///   `priority_fee = cost` 全额，tip = `Ratio(tip_rate)`（低比例保底，
+///   防止平台因 tip 不足丢弃；这正是 `tip_rate` 存在的原因）。
+/// - **纯 tip 那笔**（`fire_v1_both!` 的 no_price 笔 / jito）：
+///   tip = `Absolute(cost)` 全额，`priority_fee = None`。
+///
+/// single nonce → 全平台只有一笔上链、只付一次费，故两笔各自尽力花到 `cost`。
+///
+/// 对应 V0 的 [`fallback_cost_mode`]。
+async fn fallback_cost_mode_v1<O: SlotOracle>(
+    d: &TxDispacher<O>,
+    ixs: &[Instruction],
+    ctx: &SendContext,
+    config: CostTxConfig,
+    timeout_secs: u64,
+) -> Result<(Signature, TransactionFormat), TxConfirmError> {
+    let rx = tx_result_channel::subscribe();
+    let mut sigs = HashSet::new();
+
+    // 带 price 那笔：cost 全额 → priority_fee
+    let cfg_with_price = config.as_fee_config();
+    // 纯 tip 那笔：priority_fee = None，cost 全落 tip
+    let cfg_no_price = config.as_tip_channel_config();
+
+    // 两个 tip 值：带 price 那笔用低比例保底，纯 tip 那笔用全额。
+    let with_price_tip = Some(TipStrategy::Ratio(config.tip_rate));
+    let no_price_tip = Some(TipStrategy::Absolute(config.cost));
+
+    macro_rules! fire_v1_with_price {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(with_price_tip, min);
+                fire_v1_client(c, ixs, ctx, tip, cfg_with_price, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    macro_rules! fire_v1_both {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let t1 = opt_tip(with_price_tip, min);
+                let t2 = opt_tip(no_price_tip, min);
+                fire_v1_client(c, ixs, ctx, t1, cfg_with_price, Some(&*MEMO_TAG), &mut sigs);
+                fire_v1_client(c, ixs, ctx, t2, cfg_no_price, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    macro_rules! fire_v1_no_price {
+        ($client_opt:expr $(,)?) => {
+            if let Some(c) = &$client_opt {
+                let min = c.as_ref().get_min_tip_amount();
+                let tip = opt_tip(no_price_tip, min);
+                fire_v1_client(c, ixs, ctx, tip, cfg_no_price, Some(&*MEMO_TAG), &mut sigs);
+            }
+        };
+    }
+
+    log::info!(
+        "[fallback_cost_mode_v1] cost={} cu_limit={} tip_rate={}",
+        config.cost,
+        config.cu_limit,
+        config.tip_rate
+    );
+
+    // ── 平台组合（与 fallback_mode_v1 逐项一致，只是 tip/fee 换成 cost 语义）──
+    #[cfg(feature = "everstake_quic")]
+    fire_v1_with_price!(d.everstake_quic);
+    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    fire_v1_with_price!(d.everstake);
+
+    #[cfg(feature = "astralane_quic")]
+    fire_v1_both!(d.astralane_quic);
+    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    fire_v1_both!(d.astralane);
+
+    #[cfg(feature = "flash_block")]
+    fire_v1_both!(d.flash_block);
+
+    #[cfg(feature = "nodeone")]
+    fire_v1_with_price!(d.nodeone);
+    #[cfg(feature = "blockrazor")]
+    fire_v1_with_price!(d.blockrazor);
+
+    #[cfg(feature = "temporal")]
+    fire_v1_both!(d.temporal);
+
+    #[cfg(feature = "helius")]
+    fire_v1_with_price!(d.helius_max);
+    #[cfg(feature = "helius")]
+    fire_v1_with_price!(d.helius_swqos);
+
+    #[cfg(feature = "zeroslot")]
+    fire_v1_both!(d.zeroslot);
+
+    #[cfg(feature = "nextblock")]
+    fire_v1_with_price!(d.nextblock);
+    #[cfg(feature = "stellium")]
+    fire_v1_with_price!(d.stellium);
+
+    // Jito bundle 靠 tip 排序 → 只发 no_price（全额 tip）
+    #[cfg(feature = "jito")]
+    fire_v1_no_price!(d.jito);
+
+    log::info!("[fallback_cost_mode_v1] fired {} tx(s)", sigs.len());
+    confirm_tx(rx, sigs, timeout_secs).await
+}
+
+// ── tip_only_auto_v1 ──────────────────────────────────────────────────────────
 /// V1 版 [`tip_only_auto`]。`priority_fee = 调用方传入值`（不超 0.0001 SOL 上限）。
 async fn tip_only_auto_v1<O: SlotOracle>(
     d: &TxDispacher<O>,

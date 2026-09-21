@@ -109,6 +109,84 @@ pub struct CostConfig {
     pub tip_rate: f64,
 }
 
+// ── CostTxConfig（V1）─────────────────────────────────────────────────────────
+
+/// **V1 的单预算竞价配置** —— 结构与 [`V1TxConfig`] 完全一致，
+/// 只把 `priority_fee` 改名为 `cost`，并额外带一个 `tip_rate`。
+///
+/// # 为什么要单独一个类型
+///
+/// [`V1TxConfig::priority_fee`] 是**已落地的竞价值**（确定走 priority_fee 通道）。
+/// 而 cost 语义表达的是**意图**：「这笔我愿意花多少，具体落在哪个通道由平台性质决定」。
+///
+/// 两者的区别**必须体现在类型上**，否则：
+///
+/// - `dispatch_v1` 只能接受一个 config，无法表达「带 price 笔 fee=cost / 纯 tip 笔 fee=None」
+/// - `send_with_cost_v1` 只能硬把 `cost` 塞进 `priority_fee`，`tip_rate` 无处安放
+///
+/// # cost 怎么落地（由各 `*_cost_mode_v1` 自行决定）
+///
+/// | 平台 | 落成 |
+/// |---|---|
+/// | Harmonic | `priority_fee = cost`（`uses_tip_transfer()=false`，它本就是 gas 竞价） |
+/// | Jito / TipOnly | `tip = Absolute(cost)` |
+/// | Fallback 带 price 笔 | `priority_fee = cost` + `tip = Ratio(tip_rate)` 保底 |
+/// | Fallback 纯 tip 笔 | `tip = Absolute(cost)` |
+///
+/// 这正是 V0 [`CostConfig`] 分流行为的 V1 对应物。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CostTxConfig {
+    /// 单笔竞价总预算（lamports）。**由各 mode 决定落地为 tip 还是 priority_fee。**
+    pub cost: u64,
+    /// compute units 上限。
+    pub cu_limit: u32,
+    /// 「带 price 那笔」的 tip 倍率（相对平台最低 tip，如 1.05）。
+    ///
+    /// 与 [`CostConfig::tip_rate`] 同义：保证带 priority_fee 的那笔不至于
+    /// 因 tip 不足被平台丢弃，但不过度抬高。
+    pub tip_rate: f64,
+}
+
+impl CostTxConfig {
+    /// 最小构造：只给 cost / cu_limit，`tip_rate` 默认 1.05。
+    pub fn new(cost: u64, cu_limit: u32) -> Self {
+        Self {
+            cost,
+            cu_limit,
+            tip_rate: 1.05,
+        }
+    }
+
+    /// 覆盖 tip_rate。
+    pub fn with_tip_rate(mut self, tip_rate: f64) -> Self {
+        self.tip_rate = tip_rate;
+        self
+    }
+
+    /// 转成 [`V1TxConfig`]，`cost` 落地到 **`priority_fee`**。
+    ///
+    /// `..Default::default()` 保证 `loaded_accounts_data_size_limit` / `heap_size`
+    /// 拿到默认值（V1 下若为 `None` 链上按 0 处理 → 交易失败）。
+    pub fn as_fee_config(&self) -> sol_tx_send::platform_clients::V1TxConfig {
+        sol_tx_send::platform_clients::V1TxConfig {
+            priority_fee: Some(self.cost),
+            compute_unit_limit: Some(self.cu_limit),
+            ..Default::default()
+        }
+    }
+
+    /// 转成 [`V1TxConfig`]，**不给 `priority_fee`**（`cost` 落地到 tip 通道）。
+    ///
+    /// ⚠️ 同样必须走 `..Default::default()`。
+    pub fn as_tip_channel_config(&self) -> sol_tx_send::platform_clients::V1TxConfig {
+        sol_tx_send::platform_clients::V1TxConfig {
+            priority_fee: None,
+            compute_unit_limit: Some(self.cu_limit),
+            ..Default::default()
+        }
+    }
+}
+
 // ── feature-gated 平台客户端导入 ──────────────────────────────────────────────
 
 #[cfg(feature = "astralane")]
@@ -525,47 +603,64 @@ impl<O: SlotOracle> TxDispacher<O> {
             .map_err(into_tx_confirm_err)
     }
 
-    /// V1 版 [`send_with_cost`]。单预算 `cost_amount` 全额作为 `priority_fee` 总额。
+    /// V1 版 [`send_with_cost`] —— **单预算 `cost`，由各 mode 决定落地通道**。
+    ///
+    /// # 与 V0 的对应关系
+    ///
+    /// 语义与 V0 [`send_with_cost`] 完全一致，只是把「`cu_price` 换算」换成
+    /// 「`priority_fee` 直给」（两者数学等价）：
+    ///
+    /// | V0 | V1 |
+    /// |---|---|
+    /// | `cu_price = cost × 1e6 / cu_limit` | `priority_fee = cost` |
+    /// | `tip = Absolute(cost)`（纯 tip 笔） | 同 |
+    /// | `tip = Ratio(tip_rate)`（带 price 笔保底） | 同 |
+    ///
+    /// ⚠️ **不再**只把 `cost` 一刀切塞进 `priority_fee` —— 那是丢失语义的做法
+    /// （`tip_rate` 无处安放、纯 tip 平台拿不到 tip）。落地由
+    /// [`strategy::dispatch_with_cost_v1`] 按 route 分派给各 `*_cost_mode_v1` 决定。
     pub async fn send_with_cost_v1(
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
         ctx: &SendContext,
         target_slot: u64,
-        config: CostConfig,
+        config: CostTxConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
-        let v1_config = V1TxConfig {
-            priority_fee: Some(config.cost_amount),
-            compute_unit_limit: Some(config.cu_limit),
-            // ⚠️ 必须走 `Default`：V1 下 `loaded_accounts_data_size_limit` / `heap_size`
-            //    若为 `None`，链上按 0 处理 → 交易直接失败（gas 白烧）。
-            //    `Default` 给的是 64 MiB / 32 KB。
-            ..Default::default()
-        };
-        // FIFO leader：不参与竞价，priority_fee=None
+        // FIFO leader：不参与竞价，cost 不生效（priority_fee=None 且不给 tip）
         if self.is_fifo_leader(target_slot) {
             log::info!(
-                "[TxDispacher::send_with_cost_v1] slot={} route={:?} 命中 FIFO leader → cost 不生效 priority_fee=None",
+                "[TxDispacher::send_with_cost_v1] slot={} route={:?} 命中 FIFO leader → cost 不生效",
                 target_slot,
                 route
             );
-            let cfg = V1TxConfig {
-                priority_fee: None,
-                ..v1_config
-            };
-            return strategy::dispatch_v1(self, ixs, ctx, route, None, cfg, confirm_timeout_secs)
-                .await
-                .map_err(into_tx_confirm_err);
+            return strategy::dispatch_v1(
+                self,
+                ixs,
+                ctx,
+                route,
+                None,
+                // FIFO 下只需 cu_limit，priority_fee 置 None
+                sol_tx_send::platform_clients::V1TxConfig {
+                    priority_fee: None,
+                    compute_unit_limit: Some(config.cu_limit),
+                    ..Default::default()
+                },
+                confirm_timeout_secs,
+            )
+            .await
+            .map_err(into_tx_confirm_err);
         }
         log::info!(
-            "[TxDispacher::send_with_cost_v1] slot={} route={:?} cost={} cu_limit={}",
+            "[TxDispacher::send_with_cost_v1] slot={} route={:?} cost={} cu_limit={} tip_rate={}",
             target_slot,
             route,
-            config.cost_amount,
-            config.cu_limit
+            config.cost,
+            config.cu_limit,
+            config.tip_rate
         );
-        strategy::dispatch_v1(self, ixs, ctx, route, None, v1_config, confirm_timeout_secs)
+        strategy::dispatch_with_cost_v1(self, ixs, ctx, route, config, confirm_timeout_secs)
             .await
             .map_err(into_tx_confirm_err)
     }
