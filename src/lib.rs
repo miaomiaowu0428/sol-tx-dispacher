@@ -201,7 +201,7 @@ pub const DEFAULT_TIP_RATE: f64 = 1.05;
 ///
 /// | 变体 | 含义 | 底层接口 |
 /// |---|---|---|
-/// | [`SpendMode::FixedTip`] | 「tip = 这个值」，gas 由 `cu_limit` 另算 | [`TxDispacher::send_tip_only_v1`] |
+/// | [`SpendMode::FixedTip`] | 「tip = 这个值」（+ 可选保底 gas） | [`TxDispacher::send_tip_only_v1`] |
 /// | [`SpendMode::Cost`] | 「这笔总共花这么多」，落地通道由平台性质决定 | [`TxDispacher::send_with_cost_v1`] |
 ///
 /// # 为什么需要区分
@@ -214,11 +214,36 @@ pub const DEFAULT_TIP_RATE: f64 = 1.05;
 /// 拆成 enum 后，每个调用点**必须显式选一种**，语义不会再混。
 #[derive(Debug, Clone, Copy)]
 pub enum SpendMode {
-    /// **固定 tip**：`tip` 原样交给底层，`priority_fee = None`。
+    /// **固定 tip**：`tip` 原样交给底层；`gas` 是调用方**显式声明**的保底 gas。
     ///
-    /// - `None` = **不给 tip**（平台默认，等价 V0 的 `tip = None`）
-    /// - `Some(n)` = 精确 `n` lamports（`n` 可为 `0`）
-    FixedTip(Option<u64>),
+    /// - `tip = None` = **不给 tip**（平台默认，等价 V0 的 `tip = None`）
+    /// - `tip = Some(n)` = 精确 `n` lamports（`n` 可为 `0`）
+    /// - `gas = None` = **不带 `priority_fee` 字段**（不是 0 —— 「不表态」与「给 0」在类型上分开）
+    /// - `gas = Some(n)` = 精确 `n` lamports，**原样落地**
+    ///
+    /// # `gas` 的落地范围（刻意收窄到一个点）
+    ///
+    /// 只在 **`SendRoute::Fallback` 双发平台的「tip 竞价腿」**上生效 —— 即
+    /// `fire_v1_both!` 里 `no_price` 那一笔（那笔原本 `priority_fee = None`）。
+    /// 效果 = 「SOL tip 主竞价 + 一点点 gas 保底」。
+    ///
+    /// 其余通道**一律忽略**，保持原状：
+    ///
+    /// - Fallback 的「带价腿」（`with_price` 侧）→ 仍旧只用 `Ratio(1.05)` 的 tip 保底
+    /// - Fallback 的单发平台、Jito → 不动
+    /// - Harmonic → 它只认 `priority_fee`（`uses_tip_transfer() = false`），本就不走 tip 腿
+    ///
+    /// # 为什么不给 `gas` 兜底默认值
+    ///
+    /// dispatcher **不替调用方决定 gas 值**：任何「`None` → 某个默认值」「给低了就抬到下限」
+    /// 的写法都会让调用方无法表达「我只想给这么点」。所以这里只做**原样透传** ——
+    /// `Some(1)` 就是 1 lamports，没人拦；不想要 gas 就填 `None`（与旧行为逐字节相同）。
+    FixedTip {
+        /// SOL tip 转账额（`None` = 平台默认）
+        tip: Option<u64>,
+        /// 保底 gas（V1 `priority_fee`，lamports 总额）。`None` = 不带该字段
+        gas: Option<u64>,
+    },
 
     /// **单笔竞价总预算（lamports）**：落地为 tip 还是 `priority_fee` 由平台性质决定。
     ///
@@ -227,19 +252,43 @@ pub enum SpendMode {
 }
 
 impl SpendMode {
-    /// 便捷：精确 tip。
+    /// 便捷：精确 tip（不带 gas）。
     pub const fn tip(n: u64) -> Self {
-        Self::FixedTip(Some(n))
+        Self::FixedTip { tip: Some(n), gas: None }
     }
 
-    /// 便捷：不给 tip（平台默认）。
+    /// 便捷：不给 tip（平台默认，也不带 gas）。
     pub const fn no_tip() -> Self {
-        Self::FixedTip(None)
+        Self::FixedTip { tip: None, gas: None }
     }
 
     /// 便捷：单笔总预算。
     pub const fn cost(n: u64) -> Self {
         Self::Cost(n)
+    }
+
+    /// 便捷：固定 tip + 可选保底 gas（落地范围见 [`Self::FixedTip`] 的文档）。
+    pub const fn fixed_tip(tip: Option<u64>, gas: Option<u64>) -> Self {
+        Self::FixedTip { tip, gas }
+    }
+
+    /// 挂上保底 gas（仅 `FixedTip` 有意义；`Cost` 原样返回）。
+    ///
+    /// 读起来就是「tip = 这个值，再补一点点 gas」：
+    /// `SpendMode::tip(cost).with_gas(100_000)`。
+    pub const fn with_gas(self, gas: u64) -> Self {
+        match self {
+            Self::FixedTip { tip, .. } => Self::FixedTip { tip, gas: Some(gas) },
+            other => other,
+        }
+    }
+
+    /// 保底 gas（仅 `FixedTip` 有；`Cost` 恒为 `None`）。
+    pub const fn gas_opt(&self) -> Option<u64> {
+        match self {
+            Self::FixedTip { gas, .. } => *gas,
+            Self::Cost(_) => None,
+        }
     }
 }
 
@@ -291,9 +340,11 @@ impl SpendConfig {
         }
     }
 
-    /// 便捷：固定 tip（`None` = 平台默认）。
-    pub fn fixed_tip(tip: Option<u64>, cu_limit: u32) -> Self {
-        Self::new(SpendMode::FixedTip(tip), cu_limit)
+    /// 便捷：固定 tip（`None` = 平台默认）+ 可选保底 gas。
+    ///
+    /// `gas` 的落地范围见 [`SpendMode::FixedTip`] 的文档（**只在 Fallback 的 tip 竞价腿**）。
+    pub fn fixed_tip(tip: Option<u64>, gas: Option<u64>, cu_limit: u32) -> Self {
+        Self::new(SpendMode::fixed_tip(tip, gas), cu_limit)
     }
 
     /// 便捷：精确 tip。
@@ -342,6 +393,13 @@ impl SpendConfig {
     /// 用于「走 SOL tip 竞价」的通道。⚠️ **必须走 `..Default::default()`**：
     /// V1 下 `loaded_accounts_data_size_limit` / `heap_size` 若为 `None`，
     /// 链上按 0 处理 → 交易直接失败（gas 白烧）。
+    ///
+    /// # ⚠️ 这里**故意**不塞 `FixedTip.gas`
+    ///
+    /// `gas` 只该落在 Fallback 的 tip 竞价腿上。若塞进这个通用 config，
+    /// Harmonic / Jito / Fallback 的**带价腿**都会跟着带上 —— 那是过度放开。
+    /// 所以 `gas` 由 [`Self::gas_opt`] 单独取出、以独立参数传进
+    /// [`TxDispacher::send_v1`] 的 `tip_leg_gas`。改这里之前先看那段文档。
     pub fn as_tip_config(&self) -> sol_tx_send::platform_clients::V1TxConfig {
         sol_tx_send::platform_clients::V1TxConfig {
             priority_fee: None,
@@ -363,13 +421,13 @@ impl SpendConfig {
 
     /// 转成 [`TipStrategy`]（仅 [`SpendMode::FixedTip`] 有意义）。
     ///
-    /// - `FixedTip(None)` → `None`（平台默认）
-    /// - `FixedTip(Some(n))` → `Some(Absolute(n))`
+    /// - `FixedTip { tip: None, .. }` → `None`（平台默认）
+    /// - `FixedTip { tip: Some(n), .. }` → `Some(Absolute(n))`
     /// - `Cost(_)` → `None`（cost 模式的 tip 由 cost 语义自行推）
     pub fn as_tip_strategy(&self) -> Option<TipStrategy> {
         match self.mode {
-            SpendMode::FixedTip(Some(n)) => Some(TipStrategy::Absolute(n)),
-            SpendMode::FixedTip(None) | SpendMode::Cost(_) => None,
+            SpendMode::FixedTip { tip: Some(n), .. } => Some(TipStrategy::Absolute(n)),
+            SpendMode::FixedTip { tip: None, .. } | SpendMode::Cost(_) => None,
         }
     }
 
@@ -377,8 +435,15 @@ impl SpendConfig {
     pub fn cost_opt(&self) -> Option<u64> {
         match self.mode {
             SpendMode::Cost(n) => Some(n),
-            SpendMode::FixedTip(_) => None,
+            SpendMode::FixedTip { .. } => None,
         }
+    }
+
+    /// 保底 gas（仅 [`SpendMode::FixedTip`] 的 `gas` 字段有）。
+    ///
+    /// 落地范围见 [`SpendMode::FixedTip`] 的文档 —— **只在 Fallback 的 tip 竞价腿**。
+    pub fn gas_opt(&self) -> Option<u64> {
+        self.mode.gas_opt()
     }
 
     /// 组装 `V1TxConfig` 的「账户数据上限 / heap」部分（都走 `Default` 兜底）。
@@ -774,7 +839,7 @@ impl<O: SlotOracle> TxDispacher<O> {
     ///
     /// | 模式 | 行为 | tip 语义 |
     /// |---|---|---|
-    /// | [`SpendMode::FixedTip`] | 走 `dispatch_v1` | `None` → 平台默认；`Some(n)` → 精确 n |
+    /// | [`SpendMode::FixedTip`] | 走 `dispatch_v1` | `tip`：`None` → 平台默认；`Some(n)` → 精确 n；`gas` 只在 Fallback 的 tip 竞价腿落地 |
     /// | [`SpendMode::Cost`] | 走 `dispatch_with_cost_v1` | 落地通道由平台性质决定 |
     ///
     /// 两条路径**都**做 FIFO leader 判断与路由。
@@ -791,8 +856,10 @@ impl<O: SlotOracle> TxDispacher<O> {
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let route = self.resolve_route(target_slot);
         match cfg.mode {
-            SpendMode::FixedTip(_) => {
+            SpendMode::FixedTip { .. } => {
                 let tip_strategy = cfg.as_tip_strategy();
+                // 保底 gas：只在 Fallback 的 tip 竞价腿落地（其余 mode 忽略）
+                let tip_leg_gas = cfg.gas_opt();
                 // FIFO leader：不参与竞价（tip=None），只保留 cu_limit 等构建参数
                 let is_fifo = self.is_fifo_leader(target_slot);
                 if is_fifo {
@@ -808,6 +875,7 @@ impl<O: SlotOracle> TxDispacher<O> {
                     route,
                     if is_fifo { None } else { tip_strategy },
                     cfg.as_tip_config(),
+                    tip_leg_gas,
                     confirm_timeout_secs,
                 )
                 .await
@@ -856,6 +924,7 @@ impl<O: SlotOracle> TxDispacher<O> {
                     compute_unit_limit: Some(config.cu_limit),
                     ..Default::default()
                 },
+                None, // 保底 gas：FIFO 下不参与竞价
                 confirm_timeout_secs,
             )
             .await

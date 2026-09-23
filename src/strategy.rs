@@ -17,6 +17,24 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// 通用 memo 标签，来源于环境变量 MEMO_TAG，默认 "default"
 pub static MEMO_TAG: LazyLock<String> = LazyLock::new(|| std::env::var("MEMO_TAG").unwrap_or_else(|_| "default".to_string()));
 
+/// **Harmonic 每笔交易重复投递的次数**。
+///
+/// # 为什么 > 1
+///
+/// 策略组经验：Harmonic 单次投递**不稳定**（可能丢包）。
+/// 同一笔交易重复投递可显著提高上链率。
+///
+/// # 为什么重复投递是安全的
+///
+/// 交易走 **nonce**（`SendContext` 固定 nonce account），且每次都从同一份
+/// `ixs` + 同一个 `hash_param` 构建 ⇒ **字节完全相同 ⇒ 签名完全相同**。
+/// 链上对同一签名只接受一次（其余按 `AlreadyProcessed` 丢弃），
+/// 因此**只会成功上链一次、只付一次费**，不会重复扣款。
+///
+/// ⚠️ 重复投递会影响 `sigs` 集合：因为是同一个签名，`HashSet` 只会存 1 项，
+/// 所以 `fired N tx(s)` 日志里的计数**不代表实际投递次数**。
+pub const HARMONIC_FIRE_TIMES: usize = 3;
+
 pub(crate) async fn dispatch<O: SlotOracle>(
     d: &TxDispacher<O>,
     ixs: &[Instruction],
@@ -176,17 +194,26 @@ async fn harmonic_mode<O: SlotOracle>(
             },
         );
         // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
-        fire_client(
-            c,
-            ixs,
-            &ctx.payer,
-            None,
-            &ctx.hash_param,
-            &harmonic_cu,
-            &ctx.alt,
-            Some(&*MEMO_TAG),
-            &mut sigs,
-        );
+        //
+        // ⚠️ **重复发 [`HARMONIC_FIRE_TIMES`] 遍** —— 策略组经验：Harmonic 单次
+        //    投递不稳定，重复投递同一个交易（nonce 固定 ⇒ 字节与签名都相同，
+        //    链上只会成功一次、只付一次费）可显著提高上链率。
+        for i in 0..HARMONIC_FIRE_TIMES {
+            fire_client(
+                c,
+                ixs,
+                &ctx.payer,
+                None,
+                &ctx.hash_param,
+                &harmonic_cu,
+                &ctx.alt,
+                Some(&*MEMO_TAG),
+                &mut sigs,
+            );
+            if i + 1 < HARMONIC_FIRE_TIMES {
+                log::debug!("[harmonic_mode] 第 {}/{} 遍投递", i + 1, HARMONIC_FIRE_TIMES);
+            }
+        }
     }
 
     // AstralaneQuic / Temporal：tip_strategy × 0.9，不带 cu_price
@@ -901,17 +928,23 @@ async fn tip_only_harmonic<O: SlotOracle>(
             0
         };
         let harmonic_cu = (Some(cu_limit), if cu_price > 0 { Some(cu_price) } else { None });
-        fire_client(
-            c,
-            ixs,
-            &ctx.payer,
-            None,
-            &ctx.hash_param,
-            &harmonic_cu,
-            &ctx.alt,
-            Some(&*MEMO_TAG),
-            &mut sigs,
-        );
+        // ⚠️ 重复发 [`HARMONIC_FIRE_TIMES`] 遍（同 `harmonic_mode` 的理由）
+        for i in 0..HARMONIC_FIRE_TIMES {
+            fire_client(
+                c,
+                ixs,
+                &ctx.payer,
+                None,
+                &ctx.hash_param,
+                &harmonic_cu,
+                &ctx.alt,
+                Some(&*MEMO_TAG),
+                &mut sigs,
+            );
+            if i + 1 < HARMONIC_FIRE_TIMES {
+                log::debug!("[tip_only_harmonic] 第 {}/{} 遍投递", i + 1, HARMONIC_FIRE_TIMES);
+            }
+        }
     }
 
     fire_all_parallel(
@@ -1038,12 +1071,17 @@ pub(crate) async fn dispatch_v1<O: SlotOracle>(
     route: SendRoute,
     tip_strategy: Option<TipStrategy>,
     config: V1TxConfig,
+    // 保底 gas（`SpendMode::FixedTip.gas`）—— **只在 Fallback 的 tip 竞价腿落地**，
+    // 其余 mode 一律忽略（见 `SpendMode::FixedTip` 的文档）。
+    tip_leg_gas: Option<u64>,
     timeout_secs: u64,
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
         SendRoute::Harmonic => harmonic_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
         SendRoute::Jito => jito_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
-        SendRoute::Fallback => fallback_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
+        SendRoute::Fallback => {
+            fallback_mode_v1(d, ixs, ctx, tip_strategy, config, tip_leg_gas, timeout_secs).await
+        }
         SendRoute::TipOnly => tip_only_auto_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send_v1 failed"))
@@ -1137,6 +1175,10 @@ async fn harmonic_mode_v1<O: SlotOracle>(
     }
 
     // Harmonic：tip_strategy → priority_fee（**总额，不除 cu_limit**）
+    //
+    // ⚠️ **重复发 [`HARMONIC_FIRE_TIMES`] 遍** —— 策略组经验：Harmonic 单次投递
+    //    不稳定，重复投递同一个交易（nonce 固定 ⇒ 字节与签名都相同，链上只会
+    //    成功一次、只付一次费）可显著提高上链率。
     #[cfg(feature = "harmonic")]
     if let Some(c) = &d.harmonic {
         let tip_lamports = tip_strategy.map(|s| s.compute(0)).unwrap_or(0);
@@ -1149,15 +1191,12 @@ async fn harmonic_mode_v1<O: SlotOracle>(
             heap_size,
         };
         // tip=None，uses_tip_transfer()=false 保证不生成 SOL 转账指令
-        fire_v1_client(
-            c,
-            ixs,
-            ctx,
-            None,
-            harmonic_cfg,
-            Some(&*MEMO_TAG),
-            &mut sigs,
-        );
+        for i in 0..HARMONIC_FIRE_TIMES {
+            fire_v1_client(c, ixs, ctx, None, harmonic_cfg, Some(&*MEMO_TAG), &mut sigs);
+            if i + 1 < HARMONIC_FIRE_TIMES {
+                log::debug!("[harmonic_mode_v1] 第 {}/{} 遍投递", i + 1, HARMONIC_FIRE_TIMES);
+            }
+        }
     }
 
     #[cfg(feature = "astralane_quic")]
@@ -1257,15 +1296,24 @@ async fn fallback_mode_v1<O: SlotOracle>(
     ctx: &SendContext,
     tip_strategy: Option<TipStrategy>,
     config: V1TxConfig,
+    tip_leg_gas: Option<u64>,
     timeout_secs: u64,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
     // 带 price 那笔：priority_fee 用调用方传入值
     let cfg_with_price = config;
-    // 纯 tip 那笔：priority_fee = None
+    // 纯 tip 那笔（**不带**保底 gas）：priority_fee = None
     let cfg_no_price = V1TxConfig {
         priority_fee: None,
+        ..config
+    };
+    // ★ 双发平台的「tip 竞价腿」：把调用方**显式声明**的保底 gas 落在这一笔上。
+    //
+    // 这里只做**原样透传** —— 不补默认值、不设下限、不做继承。调用方不想要 gas
+    // 就传 `None`，那这一笔与改动前逐字节相同（`priority_fee = None`）。
+    let cfg_tip_leg = V1TxConfig {
+        priority_fee: tip_leg_gas,
         ..config
     };
 
@@ -1307,7 +1355,7 @@ async fn fallback_mode_v1<O: SlotOracle>(
                     ixs,
                     ctx,
                     t2,
-                    cfg_no_price,
+                    cfg_tip_leg,
                     Some(&*MEMO_TAG),
                     &mut sigs,
                 );
