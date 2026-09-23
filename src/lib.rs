@@ -860,11 +860,14 @@ impl<O: SlotOracle> TxDispacher<O> {
                 let tip_strategy = cfg.as_tip_strategy();
                 // 保底 gas：只在 Fallback 的 tip 竞价腿落地（其余 mode 忽略）
                 let tip_leg_gas = cfg.gas_opt();
-                // FIFO leader：不参与竞价（tip=None），只保留 cu_limit 等构建参数
+                // FIFO leader：**tip 原样给，但不给 gas**（gas 固定 0）。
+                //
+                // ⚠️ 2026-09-23 策略组改了 FIFO 的定义 —— 旧口径是「不参与竞价」
+                //    （tip=None），现在改成「照常给 tip，只是不额外付 gas」。
                 let is_fifo = self.is_fifo_leader(target_slot);
                 if is_fifo {
                     log::info!(
-                        "[TxDispacher::send_v1] slot={} route={route:?} 命中 FIFO leader → tip=None",
+                        "[TxDispacher::send_v1] slot={} route={route:?} 命中 FIFO leader → tip 原样、gas=0",
                         target_slot
                     );
                 }
@@ -873,9 +876,9 @@ impl<O: SlotOracle> TxDispacher<O> {
                     ixs,
                     ctx,
                     route,
-                    if is_fifo { None } else { tip_strategy },
+                    tip_strategy,
                     cfg.as_tip_config(),
-                    tip_leg_gas,
+                    if is_fifo { None } else { tip_leg_gas },
                     confirm_timeout_secs,
                 )
                 .await
@@ -924,7 +927,7 @@ impl<O: SlotOracle> TxDispacher<O> {
                     compute_unit_limit: Some(config.cu_limit),
                     ..Default::default()
                 },
-                None, // 保底 gas：FIFO 下不参与竞价
+                None, // 保底 gas：FIFO 下不给
                 confirm_timeout_secs,
             )
             .await

@@ -1063,7 +1063,10 @@ async fn tip_only_fallback<O: SlotOracle>(
 // 各模式的平台组合与行为与 V0 完全一致，只换构建参数。
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// V1 版 [`dispatch`]。`route` / `tip_strategy` / FIFO 语义与 V0 一致。
+/// V1 版 [`dispatch`]。`route` / `tip_strategy` 语义与 V0 一致。
+///
+/// ⚠️ **FIFO 语义与 V0 不同**：V0 命中 FIFO 时 `tip=None`（不参与竞价），
+/// V1 改为「**tip 原样给、gas 不给**」（见 [`TxDispacher::send_v1`]）。
 pub(crate) async fn dispatch_v1<O: SlotOracle>(
     d: &TxDispacher<O>,
     ixs: &[Instruction],
