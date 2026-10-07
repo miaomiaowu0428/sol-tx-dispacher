@@ -47,7 +47,9 @@ pub(crate) async fn dispatch<O: SlotOracle>(
     let result = match route {
         SendRoute::Harmonic => harmonic_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
         SendRoute::Jito => jito_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
-        SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
+        // P2pTurbo = Fallback 全平台广播 + 追加 Syncro 通道
+        SendRoute::P2pTurbo => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs, true).await,
+        SendRoute::Fallback => fallback_mode(d, ixs, ctx, tip_strategy, cu, timeout_secs, false).await,
         SendRoute::TipOnly => tip_only_auto(d, ixs, ctx, tip_strategy, cu, timeout_secs).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send failed"))
@@ -76,7 +78,9 @@ pub(crate) async fn dispatch_with_cost<O: SlotOracle>(
     timeout_secs: u64,
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let result = match route {
-        SendRoute::Fallback => fallback_cost_mode(d, ixs, ctx, config, timeout_secs).await,
+        SendRoute::Fallback => fallback_cost_mode(d, ixs, ctx, config, timeout_secs, false).await,
+        // P2pTurbo = Fallback cost 双发 + 追加 Syncro 通道
+        SendRoute::P2pTurbo => fallback_cost_mode(d, ixs, ctx, config, timeout_secs, true).await,
         // Harmonic / Jito / TipOnly：单 tip 语义，cost 全额作为 tip 预算，
         // cu_limit 透传、无 cu_price（Harmonic 主体内部会把 tip 转 cu_price）。
         SendRoute::Harmonic => {
@@ -335,6 +339,8 @@ async fn fallback_mode<O: SlotOracle>(
     tip_strategy: Option<TipStrategy>,
     cu: (Option<u32>, Option<u64>),
     timeout_secs: u64,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
@@ -500,6 +506,18 @@ async fn fallback_mode<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_no_price!(d.jito, tip: tip_strategy);
 
+    // ── P2P.org Turbo：追加 P2P 自家 Syncro 通道（带 key 的私有端点）─────────
+    // Syncro 同时接受 tip 与 cu_price，故与 flash_block/temporal 同款走 fire_both。
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        fire_both!(d.syncro,
+            with_price: Some(TipStrategy::Ratio(1.05)),
+            no_price:   tip_strategy,
+        );
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
+
     log::info!("[fallback_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -522,6 +540,8 @@ async fn fallback_cost_mode<O: SlotOracle>(
     ctx: &SendContext,
     config: CostConfig,
     timeout_secs: u64,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let CostConfig {
         cost_amount,
@@ -668,6 +688,16 @@ async fn fallback_cost_mode<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_no_price!(d.jito);
 
+    // ── P2P.org Turbo：追加 P2P 自家 Syncro 通道（带 key 的私有端点）─────────
+    // cost 语义下与 astralane/flash_block/temporal 同款双发：带 price 笔用
+    // Ratio(tip_rate) 保底、纯 tip 笔拿全额 cost。
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        fire_both!(d.syncro);
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
+
     log::info!("[fallback_cost_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -785,6 +815,7 @@ async fn tip_only_auto<O: SlotOracle>(
         cu_limit,
         Some(cu_price),
         Some(MEMO_TAG.to_string()),
+        false,
         &mut sigs,
     )
     .await;
@@ -810,8 +841,10 @@ pub(crate) async fn dispatch_tip_only<O: SlotOracle>(
     let result = match route {
         SendRoute::Harmonic => tip_only_harmonic(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
         SendRoute::Jito => tip_only_jito(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
-        SendRoute::Fallback => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
-        SendRoute::TipOnly => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs).await,
+        // P2pTurbo = 全平台 tip-only + 追加 Syncro 通道
+        SendRoute::P2pTurbo => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs, true).await,
+        SendRoute::Fallback => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs, false).await,
+        SendRoute::TipOnly => tip_only_fallback(d, ixs, ctx, min_tip_floor, cu_limit, timeout_secs, false).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send_tip_only failed"))
 }
@@ -826,6 +859,8 @@ async fn fire_all_parallel(
     cu_limit: u32,
     cu_price: Option<u64>,
     memo: Option<String>,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
     sigs: &mut HashSet<Signature>,
 ) {
     use sol_tx_send::platform_clients::{BuildTx, BuildV0Tx, SendTx};
@@ -897,6 +932,14 @@ async fn fire_all_parallel(
     #[cfg(feature = "stellium")]
     spawn_fire!(d.stellium);
 
+    // P2P.org Turbo：追加 Syncro 通道（tip-only：tip=max(floor, 平台最低)，带 cu_price）
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        spawn_fire!(d.syncro);
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
+
     for h in handles {
         let _ = h.await;
     }
@@ -955,6 +998,7 @@ async fn tip_only_harmonic<O: SlotOracle>(
         cu_limit,
         None,
         Some(MEMO_TAG.to_string()),
+        false,
         &mut sigs,
     )
     .await;
@@ -1025,6 +1069,8 @@ async fn tip_only_fallback<O: SlotOracle>(
     min_tip_floor: u64,
     cu_limit: u32,
     timeout_secs: u64,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
 ) -> anyhow::Result<(Signature, TransactionFormat)> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
@@ -1037,6 +1083,7 @@ async fn tip_only_fallback<O: SlotOracle>(
         cu_limit,
         None,
         Some(MEMO_TAG.to_string()),
+        add_syncro,
         &mut sigs,
     )
     .await;
@@ -1083,7 +1130,11 @@ pub(crate) async fn dispatch_v1<O: SlotOracle>(
         SendRoute::Harmonic => harmonic_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
         SendRoute::Jito => jito_mode_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
         SendRoute::Fallback => {
-            fallback_mode_v1(d, ixs, ctx, tip_strategy, config, tip_leg_gas, timeout_secs).await
+            fallback_mode_v1(d, ixs, ctx, tip_strategy, config, tip_leg_gas, timeout_secs, false).await
+        }
+        // P2pTurbo = Fallback 全平台广播 + 追加 Syncro 通道
+        SendRoute::P2pTurbo => {
+            fallback_mode_v1(d, ixs, ctx, tip_strategy, config, tip_leg_gas, timeout_secs, true).await
         }
         SendRoute::TipOnly => tip_only_auto_v1(d, ixs, ctx, tip_strategy, config, timeout_secs).await,
     };
@@ -1121,7 +1172,9 @@ pub(crate) async fn dispatch_with_cost_v1<O: SlotOracle>(
         SendRoute::Jito => jito_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
         SendRoute::TipOnly => tip_only_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
         // Fallback 是**兜底**：路由没命中具体出块源时走这条，需要双发（with_price + 纯 tip）。
-        SendRoute::Fallback => fallback_cost_mode_v1(d, ixs, ctx, config, timeout_secs).await,
+        SendRoute::Fallback => fallback_cost_mode_v1(d, ixs, ctx, config, timeout_secs, false).await,
+        // P2pTurbo = Fallback cost 双发 + 追加 Syncro 通道
+        SendRoute::P2pTurbo => fallback_cost_mode_v1(d, ixs, ctx, config, timeout_secs, true).await,
     };
     result.map_err(|e| anyhow::Error::from(e).context("send_with_cost_v1 failed"))
 }
@@ -1301,6 +1354,8 @@ async fn fallback_mode_v1<O: SlotOracle>(
     config: V1TxConfig,
     tip_leg_gas: Option<u64>,
     timeout_secs: u64,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
@@ -1436,6 +1491,17 @@ async fn fallback_mode_v1<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito, tip: tip_strategy);
 
+    // ── P2P.org Turbo：追加 P2P 自家 Syncro 通道（带 key 的私有端点）─────────
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        fire_v1_both!(d.syncro,
+            with_price: Some(TipStrategy::Ratio(1.05)),
+            no_price:   tip_strategy,
+        );
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
+
     log::info!("[fallback_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -1546,6 +1612,8 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     ctx: &SendContext,
     config: CostTxConfig,
     timeout_secs: u64,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
 ) -> Result<(Signature, TransactionFormat), TxConfirmError> {
     let rx = tx_result_channel::subscribe();
     let mut sigs = HashSet::new();
@@ -1637,6 +1705,14 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito);
 
+    // ── P2P.org Turbo：追加 P2P 自家 Syncro 通道（带 key 的私有端点）─────────
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        fire_v1_both!(d.syncro);
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
+
     log::info!("[fallback_cost_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -1681,7 +1757,7 @@ async fn tip_only_auto_v1<O: SlotOracle>(
         );
     }
 
-    fire_all_parallel_v1(d, ixs, ctx, min_tip_floor, cfg, Some(MEMO_TAG.to_string()), &mut sigs).await;
+    fire_all_parallel_v1(d, ixs, ctx, min_tip_floor, cfg, Some(MEMO_TAG.to_string()), false, &mut sigs).await;
     log::info!("[tip_only_auto_v1] priority_fee={priority_fee} fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -1696,6 +1772,8 @@ async fn fire_all_parallel_v1(
     min_tip_floor: u64,
     config: V1TxConfig,
     memo: Option<String>,
+    // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
+    add_syncro: bool,
     sigs: &mut HashSet<Signature>,
 ) {
     use sol_tx_send::platform_clients::{BuildV1Tx, SendTx};
@@ -1763,6 +1841,14 @@ async fn fire_all_parallel_v1(
     spawn_fire_v1!(d.nextblock);
     #[cfg(feature = "stellium")]
     spawn_fire_v1!(d.stellium);
+
+    // P2P.org Turbo：追加 Syncro 通道
+    #[cfg(feature = "syncro")]
+    if add_syncro {
+        spawn_fire_v1!(d.syncro);
+    }
+    #[cfg(not(feature = "syncro"))]
+    let _ = add_syncro;
 
     for h in handles {
         let _ = h.await;

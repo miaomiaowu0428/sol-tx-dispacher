@@ -30,6 +30,8 @@ use sol_tx_send::platform_clients::nextblock::NextBlock;
 use sol_tx_send::platform_clients::nodeone::NodeOne;
 #[cfg(feature = "stellium")]
 use sol_tx_send::platform_clients::stellium::Stellium;
+#[cfg(feature = "syncro")]
+use sol_tx_send::platform_clients::syncro::Syncro;
 #[cfg(feature = "temporal")]
 use sol_tx_send::platform_clients::temporal::Temporal;
 #[cfg(feature = "zeroslot")]
@@ -65,6 +67,8 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     nextblock: Option<Arc<NextBlock>>,
     #[cfg(feature = "stellium")]
     stellium: Option<Arc<Stellium>>,
+    #[cfg(feature = "syncro")]
+    syncro: Option<Arc<Syncro>>,
     #[cfg(feature = "jito")]
     jito: Option<Arc<Jito>>,
     #[cfg(feature = "harmonic")]
@@ -101,6 +105,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             nextblock: None,
             #[cfg(feature = "stellium")]
             stellium: None,
+            #[cfg(feature = "syncro")]
+            syncro: None,
             #[cfg(feature = "jito")]
             jito: None,
             #[cfg(feature = "harmonic")]
@@ -188,6 +194,16 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
         self
     }
 
+    /// 注入 **P2P.org Syncro Sender**（带 API key 的私有端点）。
+    ///
+    /// 只在 `slot_leader.name == "P2P.org Turbo"` 时作为额外通道参与发送，
+    /// 见 `SendRoute::P2pTurbo`。
+    #[cfg(feature = "syncro")]
+    pub fn syncro(mut self, c: Syncro) -> Self {
+        self.syncro = Some(Arc::new(c));
+        self
+    }
+
     #[cfg(feature = "jito")]
     pub fn jito(mut self, c: Jito) -> Self {
         self.jito = Some(Arc::new(c));
@@ -231,6 +247,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             nextblock: self.nextblock,
             #[cfg(feature = "stellium")]
             stellium: self.stellium,
+            #[cfg(feature = "syncro")]
+            syncro: self.syncro,
             #[cfg(feature = "jito")]
             jito: self.jito,
             #[cfg(feature = "harmonic")]

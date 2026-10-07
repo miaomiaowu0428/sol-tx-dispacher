@@ -3,6 +3,7 @@
 //! 根据 `SlotOracle` 提供的 leader 信息，自适应地选择发送策略：
 //!
 //! - `Harmonic` leader → Harmonic 直发 + Astralane / Temporal 按 90% tip
+//! - `P2P.org Turbo` leader → fallback 全平台广播 + 追加 P2P.org Syncro Sender 通道
 //! - 已知非 Harmonic    → 0 tip 0 gas（省费用，不给不认识的服务商涨小费）
 //! - 未知 / NoopOracle  → fallback：所有平台并发双轮（等价原 send_fast）
 //!
@@ -499,6 +500,8 @@ use sol_tx_send::platform_clients::nextblock::NextBlock;
 use sol_tx_send::platform_clients::nodeone::NodeOne;
 #[cfg(feature = "stellium")]
 use sol_tx_send::platform_clients::stellium::Stellium;
+#[cfg(feature = "syncro")]
+use sol_tx_send::platform_clients::syncro::Syncro;
 #[cfg(feature = "temporal")]
 use sol_tx_send::platform_clients::temporal::Temporal;
 #[cfg(feature = "zeroslot")]
@@ -515,6 +518,13 @@ pub enum SendRoute {
     Jito,
     /// Tip-only 模式：只发 tip 竞价（不发 cu_price），全平台一发
     TipOnly,
+    /// **P2P.org Turbo** 节点出块：在 Fallback 全平台广播的**基础上追加**
+    /// P2P.org Syncro Sender 通道（带 API key 的私有端点）。
+    ///
+    /// 命中条件：`slot_leader.name == "P2P.org Turbo"`（见
+    /// [`sol_slot_leader::LeaderInfo::is_p2p_turbo`]）。tip / fee 语义与
+    /// [`SendRoute::Fallback`] 一致，只是多一路 P2P 自家 SWQoS 直发。
+    P2pTurbo,
     /// 其他所有节点（含 DB 无记录 / NoopOracle）：退化到 send_fast
     Fallback,
 }
@@ -553,6 +563,8 @@ pub struct TxDispacher<O: SlotOracle> {
     pub(crate) nextblock: Option<Arc<NextBlock>>,
     #[cfg(feature = "stellium")]
     pub(crate) stellium: Option<Arc<Stellium>>,
+    #[cfg(feature = "syncro")]
+    pub(crate) syncro: Option<Arc<Syncro>>,
     #[cfg(feature = "jito")]
     pub(crate) jito: Option<Arc<Jito>>,
     #[cfg(feature = "harmonic")]
@@ -656,7 +668,13 @@ impl<O: SlotOracle> TxDispacher<O> {
                 }
             }
         }
-        // 2. 再按客户端类型匹配
+        // 2. P2P.org Turbo：在 fallback 广播之外追加 Syncro 通道
+        if let Some(ref info) = info {
+            if info.is_p2p_turbo() {
+                return SendRoute::P2pTurbo;
+            }
+        }
+        // 3. 再按客户端类型匹配
         match info {
             Some(info) if info.is_harmonic() => SendRoute::Harmonic,
             Some(info) if info.is_jito() => SendRoute::Jito,
@@ -1031,6 +1049,37 @@ mod tests {
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
     }
 
+    #[test]
+    fn p2p_turbo_name_routes_to_p2p_turbo() {
+        let oracle = MockOracle {
+            harmonic: false,
+            name: Some("P2P.org Turbo"),
+        };
+        let d = TxDispacher::builder(oracle).build();
+        assert_eq!(d.resolve_route(100), SendRoute::P2pTurbo);
+    }
+
+    #[test]
+    fn p2p_turbo_has_priority_over_harmonic() {
+        // 即使是 Harmonic 客户端，只要名字是 P2P.org Turbo 就走 P2pTurbo
+        let oracle = MockOracle {
+            harmonic: true,
+            name: Some("P2P.org Turbo"),
+        };
+        let d = TxDispacher::builder(oracle).build();
+        assert_eq!(d.resolve_route(100), SendRoute::P2pTurbo);
+    }
+
+    #[test]
+    fn p2p_without_turbo_stays_fallback() {
+        let oracle = MockOracle {
+            harmonic: false,
+            name: Some("P2P.org"),
+        };
+        let d = TxDispacher::builder(oracle).build();
+        assert_eq!(d.resolve_route(100), SendRoute::Fallback);
+    }
+
     // ── TipStrategy 单元测试 ──────────────────────────────────────────────────
 
     #[test]
@@ -1076,6 +1125,11 @@ mod tests {
             // feature = "temporal"
             .temporal(sol_tx_send::platform_clients::temporal::Temporal::init_with(
                 "TEMPORAL_KEY",
+                Region::Amsterdam,
+            ))
+            // feature = "syncro"（P2P.org Turbo 出块时追加的通道，带 key 走私有端点）
+            .syncro(sol_tx_send::platform_clients::syncro::Syncro::init_with(
+                std::env::var("SYNCRO_API_KEY").unwrap_or_default(),
                 Region::Amsterdam,
             ))
             // feature = "harmonic"（等文档确认协议后传真实 UUID）
