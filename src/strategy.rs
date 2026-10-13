@@ -771,9 +771,10 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
     fire_cheap!(d.everstake);
 
+    // Astralane：QUIC 与普通版一起发（两者都开时双通道，只开一个时发对应通道）
     #[cfg(feature = "astralane_quic")]
     fire_cheap!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_cheap!(d.astralane);
 
     // 少数 HTTP 平台
