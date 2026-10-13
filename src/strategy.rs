@@ -128,9 +128,35 @@ pub(crate) async fn dispatch_with_cost<O: SlotOracle>(
 /// `None` 掉头返回 `None`，让 `fire_client` 走平台默认。
 /// `Some` 时取 `max(strategy_output, platform_min × 1.02)`，保证至少比最低价高 2%。
 #[inline]
+/// 把 tip 策略在**某个平台**上落地为 lamports（竞价通道用）。
+///
+/// - [`TipStrategy::Exact`]（`FixedTip` 的严格值）→ **原样返回 `n`**，不抬价。
+/// - `Absolute` / `Ratio` → `max(strategy 值, 平台最低 × 1.02)`，即「至少比平台门槛高 2%」，
+///   防止带价那笔因 tip 不足被平台丢弃（既定语义，不动）。
 fn opt_tip(strategy: Option<TipStrategy>, platform_min: u64) -> Option<u64> {
-    let floor = (platform_min as f64 * 1.02) as u64;
-    strategy.map(|s| s.compute(platform_min).max(floor))
+    strategy.map(|s| match s {
+        TipStrategy::Exact(n) => n,
+        other => {
+            let floor = (platform_min as f64 * 1.02) as u64;
+            other.compute(platform_min).max(floor)
+        }
+    })
+}
+
+/// TipOnly 路由下**每个平台**实际写入的 tip（`tip_only_auto_v1` / `fire_all_parallel_v1` 用）。
+///
+/// - [`TipStrategy::Exact`]（`FixedTip` 的严格值）→ **原样 `n`**，不抬到平台门槛。
+/// - `Absolute` / `Ratio` → `max(strategy 值, 平台最低)`（tip-only 路径的既定口径）。
+/// - `None` → `max(5_000, 平台最低)`（保持原默认）。
+fn tip_only_tip(strategy: Option<TipStrategy>, platform_min: u64) -> u64 {
+    /// 原 `min_tip_floor` 在 `tip_strategy = None` 时的默认值
+    const NONE_FLOOR: u64 = 5_000;
+
+    match strategy {
+        Some(TipStrategy::Exact(n)) => n,
+        Some(s) => s.compute(0).max(platform_min),
+        None => NONE_FLOOR.max(platform_min),
+    }
 }
 
 // ── harmonic_mode ─────────────────────────────────────────────────────────────
@@ -1375,6 +1401,15 @@ async fn fallback_mode_v1<O: SlotOracle>(
         ..config
     };
 
+    // ★ 带价腿的 tip：
+    //   · 调用方是 `FixedTip`（严格 `Exact`）→ **就用它的值**，两条腿都不抬价；
+    //   · 其余（Cost / tip=None）→ 保持原语义：`Ratio(1.05)` 平台门槛保底，
+    //     防止带 priority_fee 的那笔因 SOL tip 不足被平台丢弃。
+    let with_price_tip = match tip_strategy {
+        Some(TipStrategy::Exact(n)) => Some(TipStrategy::Exact(n)),
+        _ => Some(TipStrategy::Ratio(1.05)),
+    };
+
     macro_rules! fire_v1_with_price {
         ($client_opt:expr, tip: $tip:expr $(,)?) => {
             if let Some(c) = &$client_opt {
@@ -1440,53 +1475,53 @@ async fn fallback_mode_v1<O: SlotOracle>(
     }
 
     #[cfg(feature = "everstake_quic")]
-    fire_v1_with_price!(d.everstake_quic, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.everstake_quic, tip: with_price_tip);
     #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
-    fire_v1_with_price!(d.everstake, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.everstake, tip: with_price_tip);
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_both!(d.astralane_quic,
-        with_price: Some(TipStrategy::Ratio(1.05)),
+        with_price: with_price_tip,
         no_price:   tip_strategy,
     );
     #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
     fire_v1_both!(d.astralane,
-        with_price: Some(TipStrategy::Ratio(1.05)),
+        with_price: with_price_tip,
         no_price:   tip_strategy,
     );
 
     #[cfg(feature = "flash_block")]
     fire_v1_both!(d.flash_block,
-        with_price: Some(TipStrategy::Ratio(1.05)),
+        with_price: with_price_tip,
         no_price:   tip_strategy,
     );
 
     #[cfg(feature = "nodeone")]
-    fire_v1_with_price!(d.nodeone, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.nodeone, tip: with_price_tip);
     #[cfg(feature = "blockrazor")]
-    fire_v1_with_price!(d.blockrazor, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.blockrazor, tip: with_price_tip);
 
     #[cfg(feature = "temporal")]
     fire_v1_both!(d.temporal,
-        with_price: Some(TipStrategy::Ratio(1.05)),
+        with_price: with_price_tip,
         no_price:   tip_strategy,
     );
 
     #[cfg(feature = "helius")]
-    fire_v1_with_price!(d.helius_max, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.helius_max, tip: with_price_tip);
     #[cfg(feature = "helius")]
-    fire_v1_with_price!(d.helius_swqos, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.helius_swqos, tip: with_price_tip);
 
     #[cfg(feature = "zeroslot")]
     fire_v1_both!(d.zeroslot,
-        with_price: Some(TipStrategy::Ratio(1.05)),
+        with_price: with_price_tip,
         no_price:   tip_strategy,
     );
 
     #[cfg(feature = "nextblock")]
-    fire_v1_with_price!(d.nextblock, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.nextblock, tip: with_price_tip);
     #[cfg(feature = "stellium")]
-    fire_v1_with_price!(d.stellium, tip: Some(TipStrategy::Ratio(1.05)));
+    fire_v1_with_price!(d.stellium, tip: with_price_tip);
 
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito, tip: tip_strategy);
@@ -1495,7 +1530,7 @@ async fn fallback_mode_v1<O: SlotOracle>(
     #[cfg(feature = "syncro")]
     if add_syncro {
         fire_v1_both!(d.syncro,
-            with_price: Some(TipStrategy::Ratio(1.05)),
+            with_price: with_price_tip,
             no_price:   tip_strategy,
         );
     }
@@ -1741,11 +1776,11 @@ async fn tip_only_auto_v1<O: SlotOracle>(
         ..config
     };
 
-    let min_tip_floor = tip_strategy.map(|s| s.compute(0)).unwrap_or(5_000);
-
+    // TipOnly 路由：tip 由 [`tip_only_tip`] 决定 ——
+    // `FixedTip`（`Exact`）严格原样，其余策略仍按平台最低兜底。
     #[cfg(feature = "helius")]
     if let Some(c) = &d.helius_max {
-        let tip = Some(min_tip_floor.max(c.as_ref().get_min_tip_amount()));
+        let tip = Some(tip_only_tip(tip_strategy, c.as_ref().get_min_tip_amount()));
         fire_v1_client(
             c,
             ixs,
@@ -1757,7 +1792,7 @@ async fn tip_only_auto_v1<O: SlotOracle>(
         );
     }
 
-    fire_all_parallel_v1(d, ixs, ctx, min_tip_floor, cfg, Some(MEMO_TAG.to_string()), false, &mut sigs).await;
+    fire_all_parallel_v1(d, ixs, ctx, tip_strategy, cfg, Some(MEMO_TAG.to_string()), false, &mut sigs).await;
     log::info!("[tip_only_auto_v1] priority_fee={priority_fee} fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
@@ -1769,7 +1804,8 @@ async fn fire_all_parallel_v1(
     d: &TxDispacher<impl SlotOracle>,
     ixs: &[Instruction],
     ctx: &SendContext,
-    min_tip_floor: u64,
+    // tip 策略：`Exact`（FixedTip）严格原样，其余策略按平台最低兜底 —— 见 [`tip_only_tip`]
+    tip_strategy: Option<TipStrategy>,
     config: V1TxConfig,
     memo: Option<String>,
     // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
@@ -1787,7 +1823,7 @@ async fn fire_all_parallel_v1(
                 let c = Arc::clone(c);
                 let ixs = ixs.to_vec();
                 let payer = ctx.payer.clone();
-                let tip = Some(min_tip_floor.max(c.get_min_tip_amount()));
+                let tip = Some(tip_only_tip(tip_strategy, c.get_min_tip_amount()));
                 let hash_param = ctx.hash_param.clone();
                 let config = config;
                 let memo = memo.clone();
@@ -1907,5 +1943,44 @@ pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_cheap_v1 failed: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{opt_tip, tip_only_tip};
+    use crate::TipStrategy;
+
+    /// 平台最低 tip 取 HeliusMax / ZeroSlot / Temporal 那一档：0.001 SOL
+    const MIN_1M: u64 = 1_000_000;
+
+    /// **FixedTip（`Exact`）的 tip 在任何通道都不会被抬高。**
+    #[test]
+    fn opt_tip_exact_is_never_raised() {
+        // 低于平台最低 → 原样
+        assert_eq!(opt_tip(Some(TipStrategy::Exact(100_000)), MIN_1M), Some(100_000));
+        // 高于平台最低 → 原样，也不被压缩
+        assert_eq!(opt_tip(Some(TipStrategy::Exact(1_500_000)), MIN_1M), Some(1_500_000));
+        // 0 就是 0
+        assert_eq!(opt_tip(Some(TipStrategy::Exact(0)), MIN_1M), Some(0));
+        // tip = None → 平台默认，策略本身不产生值
+        assert_eq!(opt_tip(None, MIN_1M), None);
+    }
+
+    /// 非 `Exact`（竞价意图 `Absolute` / `Ratio`）保持原语义：至少平台最低 × 1.02。
+    #[test]
+    fn opt_tip_non_exact_still_floors_at_platform_min() {
+        assert_eq!(opt_tip(Some(TipStrategy::Absolute(100_000)), MIN_1M), Some(1_020_000));
+        assert_eq!(opt_tip(Some(TipStrategy::Ratio(1.05)), MIN_1M), Some(1_050_000));
+    }
+
+    /// TipOnly 路由：`Exact` 原样，其余策略按平台最低兜底（含 `None` 的 5000 默认）。
+    #[test]
+    fn tip_only_tip_exact_is_never_raised() {
+        assert_eq!(tip_only_tip(Some(TipStrategy::Exact(100_000)), MIN_1M), 100_000);
+        assert_eq!(tip_only_tip(Some(TipStrategy::Exact(0)), MIN_1M), 0);
+        assert_eq!(tip_only_tip(Some(TipStrategy::Absolute(100_000)), MIN_1M), MIN_1M);
+        assert_eq!(tip_only_tip(None, MIN_1M), MIN_1M);
+        assert_eq!(tip_only_tip(None, 1_000), 5_000);
+    }
 }
 

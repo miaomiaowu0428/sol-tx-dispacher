@@ -59,10 +59,20 @@ const TIP_ONLY_LEADERS: &[solana_sdk::pubkey::Pubkey] = &[
 /// Tip 计算策略（与 trade-solana-impl send_utils 保持相同语义）。
 #[derive(Debug, Clone, Copy)]
 pub enum TipStrategy {
-    /// 绝对数额（lamports）
+    /// 绝对数额（lamports）—— **竞价意图**：这是「我想给这么多」，但落地时
+    /// 仍会被抬到平台最低 tip（见 [`TipStrategy::Exact`] 的对比）。
     Absolute(u64),
     /// 相对于各平台最低 tip 的比例（例如 0.9 = 90%，1.1 = 110%）
     Ratio(f64),
+    /// **严格值（lamports）**：给定多少就是多少，**任何情况下都不抬、不缩**
+    /// —— 即使低于平台最低 tip 也原样落地。
+    ///
+    /// 语义来自 [`SpendMode::FixedTip`]：[`SpendConfig::as_tip_strategy`] 把
+    /// `FixedTip { tip: Some(n) }` 转成 `Exact(n)`，使「固定 tip」真的固定。
+    ///
+    /// ⚠️ 低于平台门槛的交易可能被平台直接丢弃 —— 这是调用方**明确要求**的取舍：
+    /// 要么按我给的值发，要么不发，而不是偷偷帮我抬价。
+    Exact(u64),
 }
 
 impl TipStrategy {
@@ -71,6 +81,8 @@ impl TipStrategy {
         match self {
             TipStrategy::Absolute(amt) => *amt,
             TipStrategy::Ratio(r) => (platform_min as f64 * r) as u64,
+            // 严格值：平台最低 tip 完全不参与计算
+            TipStrategy::Exact(amt) => *amt,
         }
     }
 
@@ -78,10 +90,12 @@ impl TipStrategy {
     ///
     /// `Absolute(n).scaled(f)` = `Absolute(n × f)`
     /// `Ratio(r).scaled(f)`    = `Ratio(r × f)`
+    /// `Exact(n).scaled(f)`    = `Exact(n)` —— **忽略缩放**，严格值就是严格值
     pub fn scaled(self, factor: f64) -> Self {
         match self {
             TipStrategy::Absolute(n) => TipStrategy::Absolute((n as f64 * factor) as u64),
             TipStrategy::Ratio(r) => TipStrategy::Ratio(r * factor),
+            TipStrategy::Exact(n) => TipStrategy::Exact(n),
         }
     }
 }
@@ -222,6 +236,15 @@ pub enum SpendMode {
     /// - `gas = None` = **不带 `priority_fee` 字段**（不是 0 —— 「不表态」与「给 0」在类型上分开）
     /// - `gas = Some(n)` = 精确 `n` lamports，**原样落地**
     ///
+    /// # `tip = Some(n)` 是**真的**精确 `n`
+    ///
+    /// 本模式落的 [`TipStrategy::Exact`] 在 dispatcher 内**不做任何抬价**：
+    /// 即使 `n` 低于目标平台的最低 tip，也原样写入/发送，绝不偷偷抬到
+    /// 「平台最低价 × 1.02」或「× 1.05」。低于门槛时平台可能直接丢弃交易 ——
+    /// 这是本模式刻意的取舍（「要么按我给的值发，要么不发」）。
+    ///
+    /// ⚠️ 只有本模式如此。`Cost` 语义仍走 `Absolute`/`Ratio`，会按平台最低 tip 兜底。
+    ///
     /// # `gas` 的落地范围（刻意收窄到一个点）
     ///
     /// 只在 **`SendRoute::Fallback` 双发平台的「tip 竞价腿」**上生效 —— 即
@@ -230,7 +253,8 @@ pub enum SpendMode {
     ///
     /// 其余通道**一律忽略**，保持原状：
     ///
-    /// - Fallback 的「带价腿」（`with_price` 侧）→ 仍旧只用 `Ratio(1.05)` 的 tip 保底
+    /// - Fallback 的「带价腿」（`with_price` 侧）→ `Ratio(1.05)` 的 tip 保底；
+    ///   **但 `FixedTip`（`Exact`）时两条腿都用调用方的严格值**，不再保底
     /// - Fallback 的单发平台、Jito → 不动
     /// - Harmonic → 它只认 `priority_fee`（`uses_tip_transfer() = false`），本就不走 tip 腿
     ///
@@ -423,11 +447,12 @@ impl SpendConfig {
     /// 转成 [`TipStrategy`]（仅 [`SpendMode::FixedTip`] 有意义）。
     ///
     /// - `FixedTip { tip: None, .. }` → `None`（平台默认）
-    /// - `FixedTip { tip: Some(n), .. }` → `Some(Absolute(n))`
+    /// - `FixedTip { tip: Some(n), .. }` → `Some(Exact(n))` —— **严格 n**，
+    ///   不会被抬到平台最低 tip（见 [`TipStrategy::Exact`]）
     /// - `Cost(_)` → `None`（cost 模式的 tip 由 cost 语义自行推）
     pub fn as_tip_strategy(&self) -> Option<TipStrategy> {
         match self.mode {
-            SpendMode::FixedTip { tip: Some(n), .. } => Some(TipStrategy::Absolute(n)),
+            SpendMode::FixedTip { tip: Some(n), .. } => Some(TipStrategy::Exact(n)),
             SpendMode::FixedTip { tip: None, .. } | SpendMode::Cost(_) => None,
         }
     }
@@ -1094,6 +1119,31 @@ mod tests {
     fn tip_strategy_absolute() {
         assert_eq!(TipStrategy::Absolute(500_000).compute(1_000_000), 500_000);
         assert_eq!(TipStrategy::Absolute(0).compute(1_000_000), 0);
+    }
+
+    /// `Exact` 是**严格值**：平台最低 tip 完全不参与，缩放也不参与。
+    #[test]
+    fn tip_strategy_exact_ignores_platform_min_and_scaling() {
+        // 低于平台最低 → 原样，不被抬高
+        assert_eq!(TipStrategy::Exact(100_000).compute(1_000_000), 100_000);
+        // 高于平台最低 → 原样，也不被压缩
+        assert_eq!(TipStrategy::Exact(5_000_000).compute(1_000_000), 5_000_000);
+        assert_eq!(TipStrategy::Exact(0).compute(1_000_000), 0);
+        // scaled 忽略缩放（Harmonic 路由的 ×0.9 不会改严格值）
+        assert_eq!(TipStrategy::Exact(100_000).scaled(0.9).compute(1_000_000), 100_000);
+    }
+
+    /// `FixedTip { tip: Some(n) }` 必须落成 `Exact(n)`；`None` / `Cost` 不产生 tip 策略。
+    #[test]
+    fn fixed_tip_maps_to_exact() {
+        let cfg = SpendConfig::fixed_tip(Some(100_000), Some(100_000), 135_000);
+        assert!(matches!(cfg.as_tip_strategy(), Some(TipStrategy::Exact(100_000))));
+
+        let none = SpendConfig::fixed_tip(None, None, 135_000);
+        assert!(none.as_tip_strategy().is_none());
+
+        let cost = SpendConfig::cost(1_000_000, 135_000);
+        assert!(cost.as_tip_strategy().is_none());
     }
 
     // ── 调用格式展示（不实际发送，只演示 API 形状）─────────────────────────
