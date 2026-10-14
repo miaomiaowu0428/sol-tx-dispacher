@@ -35,7 +35,7 @@ pub use context::{SendContext, merge_alts};
 use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
 use sol_slot_leader::SlotOracle;
-use sol_tx_send::platform_clients::{BundleSender, V1TxConfig};
+use sol_tx_send::platform_clients::{BundleSender, KeepAliveTarget, V1TxConfig, run_keep_alive};
 use std::sync::Arc;
 
 /// 走 tip-only 模式的 leader vote account（只靠 tip 竞价，不参与 cu_price 竞争）
@@ -519,6 +519,8 @@ use sol_tx_send::platform_clients::helius_max::HeliusMax;
 use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 #[cfg(feature = "jito")]
 use sol_tx_send::platform_clients::jito::Jito;
+#[cfg(feature = "landx")]
+use sol_tx_send::platform_clients::landx::LandX;
 #[cfg(feature = "nextblock")]
 use sol_tx_send::platform_clients::nextblock::NextBlock;
 #[cfg(feature = "nodeone")]
@@ -592,6 +594,8 @@ pub struct TxDispacher<O: SlotOracle> {
     pub(crate) syncro: Option<Arc<Syncro>>,
     #[cfg(feature = "jito")]
     pub(crate) jito: Option<Arc<Jito>>,
+    #[cfg(feature = "landx")]
+    pub(crate) landx: Option<Arc<LandX>>,
     #[cfg(feature = "harmonic")]
     pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
@@ -661,6 +665,95 @@ impl<O: SlotOracle> TxDispacher<O> {
             senders.push(Box::new(c.as_ref().clone()));
         }
         MultiBundleSenderV1::new(senders)
+    }
+
+    /// 已注册 HTTP 平台的保活目标：**只包含真正注入的客户端**。
+    ///
+    /// 为什么放在 dispatcher 而不是 `sol-tx-send::endpoint_keep_alive()`：
+    /// 后者会把**所有**平台的 endpoint 都探一遍，不管本进程有没有注册那些通道
+    /// （客户端初始化失败 / 没配 key 时是 `None`）。既然交易的发送路由就在这个
+    /// dispatcher 里，保活也只该覆盖它实际会用的通道。
+    ///
+    /// - endpoint 用各平台的 `get_endpoint()`（由全局 `REGION` 决定）；
+    /// - gRPC（Harmonic）与 QUIC（AstralaneQuic / EverStakeQuic）不在列：
+    ///   它们在连接层各自保活（见对应客户端）。
+    /// - 若将来把 LandX 注入 dispatcher，记得在这里补一条（LandX 有官方 `/ping`）。
+    pub fn keep_alive_targets(&self) -> Vec<KeepAliveTarget> {
+        let mut targets: Vec<KeepAliveTarget> = Vec::new();
+
+        #[cfg(feature = "astralane")]
+        if self.astralane.is_some() {
+            targets.push(KeepAliveTarget::new("Astralane", Astralane::get_endpoint()));
+        }
+        #[cfg(feature = "blockrazor")]
+        if self.blockrazor.is_some() {
+            targets.push(KeepAliveTarget::new("Blockrazor", Blockrazor::get_endpoint()));
+        }
+        #[cfg(feature = "everstake")]
+        if self.everstake.is_some() {
+            targets.push(KeepAliveTarget::new("EverStake", EverStake::get_endpoint()));
+        }
+        #[cfg(feature = "flash_block")]
+        if self.flash_block.is_some() {
+            targets.push(KeepAliveTarget::new("FlashBlock", FlashBlock::get_endpoint()));
+        }
+        #[cfg(feature = "helius")]
+        if self.helius_max.is_some() {
+            targets.push(KeepAliveTarget::new("HeliusMax", HeliusMax::get_endpoint()));
+        }
+        #[cfg(feature = "helius")]
+        if self.helius_swqos.is_some() {
+            targets.push(KeepAliveTarget::new("HeliusSwqos", HeliusSwqos::get_endpoint()));
+        }
+        #[cfg(feature = "jito")]
+        if self.jito.is_some() {
+            targets.push(KeepAliveTarget::new("Jito", Jito::get_endpoint()));
+        }
+        // LandX 有官方健康检查：GET http://<host>/ping -> "ok"
+        #[cfg(feature = "landx")]
+        if self.landx.is_some() {
+            targets.push(KeepAliveTarget::new("LandX", LandX::get_ping_endpoint()));
+        }
+        #[cfg(feature = "nodeone")]
+        if self.nodeone.is_some() {
+            targets.push(KeepAliveTarget::new("NodeOne", NodeOne::get_endpoint()));
+        }
+        #[cfg(feature = "temporal")]
+        if self.temporal.is_some() {
+            targets.push(KeepAliveTarget::new("Temporal", Temporal::get_endpoint()));
+        }
+        #[cfg(feature = "zeroslot")]
+        if self.zeroslot.is_some() {
+            targets.push(KeepAliveTarget::new("ZeroSlot", ZeroSlot::get_endpoint()));
+        }
+        #[cfg(feature = "nextblock")]
+        if self.nextblock.is_some() {
+            targets.push(KeepAliveTarget::new("NextBlock", NextBlock::get_endpoint()));
+        }
+        #[cfg(feature = "stellium")]
+        if self.stellium.is_some() {
+            targets.push(KeepAliveTarget::new("Stellium", Stellium::get_endpoint()));
+        }
+        #[cfg(feature = "syncro")]
+        if self.syncro.is_some() {
+            targets.push(KeepAliveTarget::new("Syncro", Syncro::get_endpoint()));
+        }
+
+        // 未知区域的平台会返回空 endpoint（如 Temporal / ZeroSlot），过滤掉，
+        // 否则会对着空字符串发请求。
+        targets.retain(|t| !t.url.trim().is_empty());
+        targets
+    }
+
+    /// 启动后台保活任务：每个已注册 HTTP 端点一个独立循环（间隔 / 错峰逻辑在
+    /// `sol_tx_send::platform_clients::run_keep_alive`）。
+    ///
+    /// 用法：在全局 `init()` 里 `builder.build()` 之后调一次即可。返回值可忽略；
+    /// 想停掉保活就 `handle.abort()`。
+    pub fn spawn_keep_alive(&self) -> tokio::task::JoinHandle<()> {
+        let targets = self.keep_alive_targets();
+        log::info!("[TxDispacher] keep-alive 覆盖 {} 个已注册平台", targets.len());
+        tokio::spawn(run_keep_alive(targets))
     }
 
     /// 只用 **FlashBlock** 发一笔（不挑 leader、不参与 tip/cu_price 竞价）。
@@ -1041,6 +1134,50 @@ mod tests {
     fn noop_oracle_always_fallback() {
         let d = TxDispacher::builder(NoopOracle).build();
         assert_eq!(d.resolve_route(422_000_000), SendRoute::Fallback);
+    }
+
+    // ── keep-alive 目标收集 ───────────────────────────────────────────────────
+
+    /// 没有注入任何客户端时，保活列表必须为空（不能去探没注册的通道）。
+    #[test]
+    fn no_clients_means_no_keep_alive_targets() {
+        let d = TxDispacher::builder(NoopOracle).build();
+        assert!(d.keep_alive_targets().is_empty());
+    }
+
+    /// 注入了某个平台，它就必须出现在保活列表里。
+    #[cfg(feature = "astralane")]
+    #[test]
+    fn injected_platform_appears_in_keep_alive_targets() {
+        use sol_tx_send::platform_clients::astralane::Astralane;
+
+        let d = TxDispacher::builder(NoopOracle)
+            .astralane(Astralane::init_with("test-key", Region::Frankfurt))
+            .build();
+        let targets = d.keep_alive_targets();
+        assert!(
+            targets.iter().any(|t| t.name == "Astralane"),
+            "注入 Astralane 后保活列表应包含它，实际: {targets:?}"
+        );
+        // 没注入的平台不该出现（这里只断言一个代表性平台）
+        #[cfg(feature = "jito")]
+        assert!(!targets.iter().any(|t| t.name == "Jito"));
+    }
+
+    /// LandX 注入后：出现在保活列表，且用官方 `/ping` 健康检查。
+    #[cfg(feature = "landx")]
+    #[test]
+    fn injected_landx_uses_ping_endpoint() {
+        use sol_tx_send::platform_clients::landx::LandX;
+
+        let d = TxDispacher::builder(NoopOracle)
+            .landx(LandX::init_with("test-key", Region::Frankfurt))
+            .build();
+        let targets = d.keep_alive_targets();
+        assert!(
+            targets.iter().any(|t| t.name == "LandX" && t.url.ends_with("/ping")),
+            "LandX 保活应走 /ping，实际: {targets:?}"
+        );
     }
 
     #[test]

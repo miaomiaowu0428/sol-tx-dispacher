@@ -24,6 +24,8 @@ use sol_tx_send::platform_clients::helius_max::HeliusMax;
 use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 #[cfg(feature = "jito")]
 use sol_tx_send::platform_clients::jito::Jito;
+#[cfg(feature = "landx")]
+use sol_tx_send::platform_clients::landx::LandX;
 #[cfg(feature = "nextblock")]
 use sol_tx_send::platform_clients::nextblock::NextBlock;
 #[cfg(feature = "nodeone")]
@@ -71,6 +73,8 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     syncro: Option<Arc<Syncro>>,
     #[cfg(feature = "jito")]
     jito: Option<Arc<Jito>>,
+    #[cfg(feature = "landx")]
+    landx: Option<Arc<LandX>>,
     #[cfg(feature = "harmonic")]
     harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
@@ -109,6 +113,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             syncro: None,
             #[cfg(feature = "jito")]
             jito: None,
+            #[cfg(feature = "landx")]
+            landx: None,
             #[cfg(feature = "harmonic")]
             harmonic: None,
         }
@@ -210,6 +216,13 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
         self
     }
 
+    /// 注入 **LandX**（HTTP JSON-RPC，API key 放 URL path）。
+    #[cfg(feature = "landx")]
+    pub fn landx(mut self, c: LandX) -> Self {
+        self.landx = Some(Arc::new(c));
+        self
+    }
+
     #[cfg(feature = "harmonic")]
     pub fn harmonic(mut self, c: HarmonicBlockEngine) -> Self {
         self.harmonic = Some(Arc::new(c));
@@ -251,6 +264,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             syncro: self.syncro,
             #[cfg(feature = "jito")]
             jito: self.jito,
+            #[cfg(feature = "landx")]
+            landx: self.landx,
             #[cfg(feature = "harmonic")]
             harmonic: self.harmonic,
         }

@@ -18,6 +18,7 @@ default = [
     "nextblock",
     "stellium",
     "jito",
+    "landx",
     "harmonic",
     "syncro",
 ]
@@ -35,6 +36,7 @@ full = [
     "nextblock",
     "stellium",
     "jito",
+    "landx",
     "harmonic",
     "syncro",
 ]
@@ -52,6 +54,8 @@ zeroslot        = []
 nextblock       = []
 stellium        = []
 jito            = []
+# LandX：HTTP JSON-RPC SWQoS 通道（API key 放在 URL path 里，见 LANDX_API_KEY）
+landx           = []
 harmonic        = []
 # P2P.org Syncro Sender：P2P.org Turbo 节点出块时追加的 SWQoS 通道（带 API key）
 syncro          = []
