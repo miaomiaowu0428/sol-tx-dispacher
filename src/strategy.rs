@@ -2,6 +2,13 @@
 //!
 //! - `harmonic_mode` : Harmonic 直发（不加 tip）+ Astralane/Temporal 带 90% tip
 //! - `fallback_mode` : 全量平台，三个宏按各平台特性自由组合
+//!
+//! # Temporal 注入点
+//!
+//! **Temporal 只在 Harmonic 出块场景**（[`SendRoute::Harmonic`]：`harmonic_mode` /
+//! `harmonic_mode_v1` / `tip_only_harmonic`）吃调用方指定的 tip；其余所有场景
+//! （Jito / Fallback / P2pTurbo / TipOnly / cheap）一律只给**平台最低 tip**
+//! （见 [`TEMPORAL_TIP_NON_HARMONIC`] / [`TEMPORAL_TIP_FLOOR_NON_HARMONIC`]）。
 
 use crate::{
     CostConfig, CostTxConfig, SendContext, SendRoute, TipStrategy, TxDispacher, fire::fire_client, fire::fire_v1_client,
@@ -159,6 +166,19 @@ fn tip_only_tip(strategy: Option<TipStrategy>, platform_min: u64) -> u64 {
     }
 }
 
+// ── Temporal 注入点 ───────────────────────────────────────────────────────────
+
+/// **非 Harmonic 场景**下给 Temporal 的 tip 策略：`None` → `fire_client` 不写 tip 值，
+/// 由平台自己折成最低 tip（`Temporal::get_min_tip_amount()` = 0.001 SOL）。
+///
+/// 即：**Temporal 只在 Harmonic 出块场景**吃调用方指定的 tip，其他场景一律平台最低。
+#[cfg(feature = "temporal")]
+const TEMPORAL_TIP_NON_HARMONIC: Option<TipStrategy> = None;
+
+/// 同上，用于以 `u64` floor 表达的路径：`0` 与平台最低取 `max` 后就是平台最低。
+#[cfg(feature = "temporal")]
+const TEMPORAL_TIP_FLOOR_NON_HARMONIC: u64 = 0;
+
 // ── harmonic_mode ─────────────────────────────────────────────────────────────
 
 async fn harmonic_mode<O: SlotOracle>(
@@ -250,6 +270,7 @@ async fn harmonic_mode<O: SlotOracle>(
     #[cfg(feature = "astralane_quic")]
     fire_no_price!(d.astralane_quic, tip: tip_09);
 
+    // Temporal 在 **Harmonic 场景**吃指定 tip（×0.9），这是注入点保留的唯一路径
     #[cfg(feature = "temporal")]
     fire_no_price!(d.temporal, tip: tip_09);
 
@@ -318,10 +339,15 @@ async fn jito_mode<O: SlotOracle>(
     let cu_no_price = (cu.0, None);
 
     macro_rules! fire_tip_only {
+        // 默认：吃调用方指定的 `tip_strategy`
         ($client_opt:expr $(,)?) => {
+            fire_tip_only!($client_opt, tip_strategy)
+        };
+        // 显式指定该平台的 tip 策略（`None` = 平台最低）
+        ($client_opt:expr, $tip:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let tip = opt_tip(tip_strategy, min);
+                let tip = opt_tip($tip, min);
                 fire_client(
                     c,
                     ixs,
@@ -345,8 +371,9 @@ async fn jito_mode<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_tip_only!(d.flash_block);
+    // Temporal：非 Harmonic 场景只给平台最低 tip（不吃调用方的 tip_strategy）
     #[cfg(feature = "temporal")]
-    fire_tip_only!(d.temporal);
+    fire_tip_only!(d.temporal, TEMPORAL_TIP_NON_HARMONIC);
     #[cfg(feature = "zeroslot")]
     fire_tip_only!(d.zeroslot);
     #[cfg(feature = "jito")]
@@ -507,10 +534,11 @@ async fn fallback_mode<O: SlotOracle>(
     #[cfg(feature = "blockrazor")]
     fire_with_price!(d.blockrazor, tip: Some(TipStrategy::Ratio(1.05)));
 
+    // Temporal：非 Harmonic 场景只给平台最低 tip（带 price / 纯 tip 两笔都不吃指定 tip）
     #[cfg(feature = "temporal")]
     fire_both!(d.temporal,
-        with_price: Some(TipStrategy::Ratio(1.05)),
-        no_price:   tip_strategy,
+        with_price: TEMPORAL_TIP_NON_HARMONIC,
+        no_price:   TEMPORAL_TIP_NON_HARMONIC,
     );
 
     #[cfg(feature = "helius")]
@@ -621,11 +649,16 @@ async fn fallback_cost_mode<O: SlotOracle>(
     }
 
     macro_rules! fire_both {
+        // 默认：带 price 笔用 `with_price_tip`、纯 tip 笔用 `no_price_tip`
         ($client_opt:expr $(,)?) => {
+            fire_both!($client_opt, with_price_tip, no_price_tip)
+        };
+        // 显式指定两笔的 tip 策略（Temporal 非 Harmonic 场景传两个 `None`）
+        ($client_opt:expr, $tip1:expr, $tip2:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let t1 = opt_tip(with_price_tip, min);
-                let t2 = opt_tip(no_price_tip, min);
+                let t1 = opt_tip($tip1, min);
+                let t2 = opt_tip($tip2, min);
                 fire_client(
                     c,
                     ixs,
@@ -699,8 +732,9 @@ async fn fallback_cost_mode<O: SlotOracle>(
     #[cfg(feature = "blockrazor")]
     fire_with_price!(d.blockrazor);
 
+    // Temporal：非 Harmonic 场景只给平台最低 tip（两笔都不吃 cost 语义的 tip 值）
     #[cfg(feature = "temporal")]
-    fire_both!(d.temporal);
+    fire_both!(d.temporal, TEMPORAL_TIP_NON_HARMONIC, TEMPORAL_TIP_NON_HARMONIC);
 
     #[cfg(feature = "helius")]
     fire_with_price!(d.helius_max);
@@ -850,6 +884,7 @@ async fn tip_only_auto<O: SlotOracle>(
         cu_limit,
         Some(cu_price),
         Some(MEMO_TAG.to_string()),
+        false, // harmonic_scene = false（TipOnly 路由）
         false,
         &mut sigs,
     )
@@ -894,6 +929,9 @@ async fn fire_all_parallel(
     cu_limit: u32,
     cu_price: Option<u64>,
     memo: Option<String>,
+    // 是否 Harmonic 出块场景（route = Harmonic）：只有它为 `true` 时 Temporal 才吃
+    // `min_tip_floor`，否则 Temporal 只给平台最低 tip。
+    harmonic_scene: bool,
     // 是否追加 P2P.org Syncro 通道（`SendRoute::P2pTurbo` 时为 true）
     add_syncro: bool,
     sigs: &mut HashSet<Signature>,
@@ -906,12 +944,21 @@ async fn fire_all_parallel(
     let cu = (Some(cu_limit), cu_price);
 
     macro_rules! spawn_fire {
-        ($client_opt:expr) => {
+        // 默认：tip = max(min_tip_floor, 平台最低)
+        ($client_opt:expr $(,)?) => {
+            spawn_fire!($client_opt, false)
+        };
+        // `$min_only = true`：只给平台最低 tip（Temporal 非 Harmonic 场景用）
+        ($client_opt:expr, $min_only:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let c = Arc::clone(c);
                 let ixs = ixs.to_vec();
                 let payer = ctx.payer.clone();
-                let tip = Some(min_tip_floor.max(c.get_min_tip_amount()));
+                let tip = Some(if $min_only {
+                    c.get_min_tip_amount()
+                } else {
+                    min_tip_floor.max(c.get_min_tip_amount())
+                });
                 let hash_param = ctx.hash_param.clone();
                 let cu = cu;
                 let alt = ctx.alt.clone();
@@ -950,8 +997,9 @@ async fn fire_all_parallel(
     spawn_fire!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire!(d.flash_block);
+    // Temporal：只在 Harmonic 场景吃指定的 min_tip_floor，其余场景只给平台最低 tip
     #[cfg(feature = "temporal")]
-    spawn_fire!(d.temporal);
+    spawn_fire!(d.temporal, !harmonic_scene);
     #[cfg(feature = "zeroslot")]
     spawn_fire!(d.zeroslot);
     #[cfg(feature = "nodeone")]
@@ -976,6 +1024,8 @@ async fn fire_all_parallel(
     }
     #[cfg(not(feature = "syncro"))]
     let _ = add_syncro;
+    #[cfg(not(feature = "temporal"))]
+    let _ = harmonic_scene;
 
     for h in handles {
         let _ = h.await;
@@ -1035,6 +1085,7 @@ async fn tip_only_harmonic<O: SlotOracle>(
         cu_limit,
         None,
         Some(MEMO_TAG.to_string()),
+        true, // harmonic_scene = true（Harmonic 路由，Temporal 吃指定 tip）
         false,
         &mut sigs,
     )
@@ -1059,10 +1110,15 @@ async fn tip_only_jito<O: SlotOracle>(
     let cu_no_price = (Some(cu_limit), None);
 
     macro_rules! fire_tip {
+        // 默认：tip = max(min_tip_floor, 平台最低)
         ($client_opt:expr $(,)?) => {
+            fire_tip!($client_opt, min_tip_floor)
+        };
+        // 显式指定该平台的 tip 下限（`0` = 平台最低）
+        ($client_opt:expr, $floor:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let tip = Some(min_tip_floor.max(min));
+                let tip = Some($floor.max(min));
                 fire_client(
                     c,
                     ixs,
@@ -1085,8 +1141,9 @@ async fn tip_only_jito<O: SlotOracle>(
     fire_tip!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_tip!(d.flash_block);
+    // Temporal：非 Harmonic 场景只给平台最低 tip
     #[cfg(feature = "temporal")]
-    fire_tip!(d.temporal);
+    fire_tip!(d.temporal, TEMPORAL_TIP_FLOOR_NON_HARMONIC);
     #[cfg(feature = "zeroslot")]
     fire_tip!(d.zeroslot);
     #[cfg(feature = "jito")]
@@ -1120,6 +1177,7 @@ async fn tip_only_fallback<O: SlotOracle>(
         cu_limit,
         None,
         Some(MEMO_TAG.to_string()),
+        false, // harmonic_scene = false（Fallback / P2pTurbo 路由）
         add_syncro,
         &mut sigs,
     )
@@ -1294,6 +1352,7 @@ async fn harmonic_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_no_price!(d.astralane_quic, tip: tip_09);
+    // Temporal 在 **Harmonic 场景**吃指定 tip（×0.9），这是注入点保留的唯一路径
     #[cfg(feature = "temporal")]
     fire_v1_no_price!(d.temporal, tip: tip_09);
 
@@ -1347,10 +1406,15 @@ async fn jito_mode_v1<O: SlotOracle>(
     };
 
     macro_rules! fire_v1_tip_only {
+        // 默认：吃调用方指定的 `tip_strategy`
         ($client_opt:expr $(,)?) => {
+            fire_v1_tip_only!($client_opt, tip_strategy)
+        };
+        // 显式指定该平台的 tip 策略（`None` = 平台最低）
+        ($client_opt:expr, $tip:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let tip = opt_tip(tip_strategy, min);
+                let tip = opt_tip($tip, min);
                 fire_v1_client(
                     c,
                     ixs,
@@ -1370,8 +1434,9 @@ async fn jito_mode_v1<O: SlotOracle>(
     fire_v1_tip_only!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_v1_tip_only!(d.flash_block);
+    // Temporal：非 Harmonic 场景只给平台最低 tip（不吃调用方的 tip_strategy）
     #[cfg(feature = "temporal")]
-    fire_v1_tip_only!(d.temporal);
+    fire_v1_tip_only!(d.temporal, TEMPORAL_TIP_NON_HARMONIC);
     #[cfg(feature = "zeroslot")]
     fire_v1_tip_only!(d.zeroslot);
     #[cfg(feature = "jito")]
@@ -1514,10 +1579,11 @@ async fn fallback_mode_v1<O: SlotOracle>(
     #[cfg(feature = "blockrazor")]
     fire_v1_with_price!(d.blockrazor, tip: with_price_tip);
 
+    // Temporal：非 Harmonic 场景只给平台最低 tip（带 price / 纯 tip 两笔都不吃指定 tip）
     #[cfg(feature = "temporal")]
     fire_v1_both!(d.temporal,
-        with_price: with_price_tip,
-        no_price:   tip_strategy,
+        with_price: TEMPORAL_TIP_NON_HARMONIC,
+        no_price:   TEMPORAL_TIP_NON_HARMONIC,
     );
 
     #[cfg(feature = "helius")]
@@ -1689,11 +1755,16 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     }
 
     macro_rules! fire_v1_both {
+        // 默认：带 price 笔用 `with_price_tip`、纯 tip 笔用 `no_price_tip`
         ($client_opt:expr $(,)?) => {
+            fire_v1_both!($client_opt, with_price_tip, no_price_tip)
+        };
+        // 显式指定两笔的 tip 策略（Temporal 非 Harmonic 场景传两个 `None`）
+        ($client_opt:expr, $tip1:expr, $tip2:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let min = c.as_ref().get_min_tip_amount();
-                let t1 = opt_tip(with_price_tip, min);
-                let t2 = opt_tip(no_price_tip, min);
+                let t1 = opt_tip($tip1, min);
+                let t2 = opt_tip($tip2, min);
                 fire_v1_client(c, ixs, ctx, t1, cfg_with_price, Some(&*MEMO_TAG), &mut sigs);
                 fire_v1_client(c, ixs, ctx, t2, cfg_no_price, Some(&*MEMO_TAG), &mut sigs);
             }
@@ -1736,8 +1807,9 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     #[cfg(feature = "blockrazor")]
     fire_v1_with_price!(d.blockrazor);
 
+    // Temporal：非 Harmonic 场景只给平台最低 tip（两笔都不吃 cost 语义的 tip 值）
     #[cfg(feature = "temporal")]
-    fire_v1_both!(d.temporal);
+    fire_v1_both!(d.temporal, TEMPORAL_TIP_NON_HARMONIC, TEMPORAL_TIP_NON_HARMONIC);
 
     #[cfg(feature = "helius")]
     fire_v1_with_price!(d.helius_max);
@@ -1836,12 +1908,21 @@ async fn fire_all_parallel_v1(
     let mut handles = Vec::new();
 
     macro_rules! spawn_fire_v1 {
-        ($client_opt:expr) => {
+        // 默认：tip 走 [`tip_only_tip`]（`Exact` 原样，其余按平台最低兜底）
+        ($client_opt:expr $(,)?) => {
+            spawn_fire_v1!($client_opt, false)
+        };
+        // `$min_only = true`：只给平台最低 tip（Temporal 非 Harmonic 场景用）
+        ($client_opt:expr, $min_only:expr $(,)?) => {
             if let Some(c) = &$client_opt {
                 let c = Arc::clone(c);
                 let ixs = ixs.to_vec();
                 let payer = ctx.payer.clone();
-                let tip = Some(tip_only_tip(tip_strategy, c.get_min_tip_amount()));
+                let tip = Some(if $min_only {
+                    c.get_min_tip_amount()
+                } else {
+                    tip_only_tip(tip_strategy, c.get_min_tip_amount())
+                });
                 let hash_param = ctx.hash_param.clone();
                 let config = config;
                 let memo = memo.clone();
@@ -1879,8 +1960,9 @@ async fn fire_all_parallel_v1(
     spawn_fire_v1!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire_v1!(d.flash_block);
+    // Temporal：只给平台最低 tip（本函数只服务非 Harmonic 的 TipOnly 路径）
     #[cfg(feature = "temporal")]
-    spawn_fire_v1!(d.temporal);
+    spawn_fire_v1!(d.temporal, true);
     #[cfg(feature = "zeroslot")]
     spawn_fire_v1!(d.zeroslot);
     #[cfg(feature = "nodeone")]

@@ -540,6 +540,8 @@ use sol_tx_send::platform_clients::zeroslot::ZeroSlot;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendRoute {
     /// Harmonic 系节点出块：走 Harmonic 直发 + Astralane/Temporal 90% tip
+    ///
+    /// Temporal 仅在**本路由**（Harmonic 场景）吃指定 tip；其余路由只给平台最低。
     Harmonic,
     /// Jito 节点出块：只发带 tip 的版本，跳过纯 cu_price 的交易
     Jito,
@@ -821,6 +823,10 @@ impl<O: SlotOracle> TxDispacher<O> {
     ///   - `Harmonic` leader：Astralane / Temporal 按 90% tip，Harmonic 路径不加 tip
     ///   - `Fallback`：各平台按自身最低 tip
     /// - 显式传入 `tip_strategy` 会覆盖默认值。
+    ///
+    /// ⚠️ **Temporal 只在 Harmonic 场景吃指定 tip**（×0.9）；Jito / Fallback /
+    /// P2pTurbo / TipOnly / cheap 等场景 Temporal 一律只给平台最低 tip
+    /// —— 见 `strategy::TEMPORAL_TIP_NON_HARMONIC`。
     pub async fn send(
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
