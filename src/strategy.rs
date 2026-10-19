@@ -38,8 +38,8 @@ pub static MEMO_TAG: LazyLock<String> = LazyLock::new(|| std::env::var("MEMO_TAG
 /// 链上对同一签名只接受一次（其余按 `AlreadyProcessed` 丢弃），
 /// 因此**只会成功上链一次、只付一次费**，不会重复扣款。
 ///
-/// ⚠️ 重复投递会影响 `sigs` 集合：因为是同一个签名，`HashSet` 只会存 1 项，
-/// 所以 `fired N tx(s)` 日志里的计数**不代表实际投递次数**。
+/// ⚠️ 重复投递的签名相同，`sigs` 集合只会保留 1 项；实际投递次数以
+/// `[fire]` / `[par]` 的每平台日志为准（每次都会单独打印）。
 pub const HARMONIC_FIRE_TIMES: usize = 3;
 
 pub(crate) async fn dispatch<O: SlotOracle>(
@@ -314,7 +314,6 @@ async fn harmonic_mode<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_no_price!(d.jito, tip: tip_strategy);
 
-    log::info!("[harmonic_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -382,7 +381,6 @@ async fn jito_mode<O: SlotOracle>(
     // everstake_quic / everstake / nodeone / blockrazor / helius / nextblock / stellium
     // 这些平台在 fallback 里只发 cu_price 版本，Jito 模式下跳过
 
-    log::info!("[jito_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -578,7 +576,6 @@ async fn fallback_mode<O: SlotOracle>(
     #[cfg(not(feature = "syncro"))]
     let _ = add_syncro;
 
-    log::info!("[fallback_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -705,14 +702,6 @@ async fn fallback_cost_mode<O: SlotOracle>(
         };
     }
 
-    log::info!(
-        "[fallback_cost_mode] cost={} cu_limit={} tip_rate={} → cu_price={}",
-        cost_amount,
-        cu_limit,
-        tip_rate,
-        cu_price
-    );
-
     // ── 平台组合（与 fallback_mode 一致，只是 tip 值换成 cost 语义） ─────
     #[cfg(feature = "everstake_quic")]
     fire_with_price!(d.everstake_quic);
@@ -766,7 +755,6 @@ async fn fallback_cost_mode<O: SlotOracle>(
     #[cfg(not(feature = "syncro"))]
     let _ = add_syncro;
 
-    log::info!("[fallback_cost_mode] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -826,7 +814,6 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_cheap!(d.jito);
 
-    log::info!("[dispatch_cheap] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_cheap failed: {}", e))
@@ -889,10 +876,6 @@ async fn tip_only_auto<O: SlotOracle>(
         &mut sigs,
     )
     .await;
-    log::info!(
-        "[tip_only_auto] cu_limit={cu_limit} cu_price={cu_price} fired {} tx(s)",
-        sigs.len()
-    );
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -964,6 +947,9 @@ async fn fire_all_parallel(
                 let alt = ctx.alt.clone();
                 let memo = memo.clone();
                 let sigs = sigs_shared.clone();
+                let region = crate::region_pool::current_region();
+                let slot = crate::region_pool::current_slot();
+                let gas_lamports = crate::fire::v0_gas_lamports(cu);
                 handles.push(tokio::spawn(async move {
                     let memo_ref: Option<&str> = memo.as_deref();
                     let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
@@ -971,15 +957,47 @@ async fn fire_all_parallel(
                         Ok(env) => {
                             let sig = env.sig();
                             let tx = env.inner_tx().clone();
-                            log::info!("[par] 🚀 {} sending {}", c, sig);
+                            log::info!(
+                                "[par] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={}",
+                                c,
+                                slot,
+                                region,
+                                tip,
+                                cu,
+                                gas_lamports,
+                                sig
+                            );
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
                             tokio::spawn(async move {
-                                let _ = sender.send_tx(&tx).await;
+                                // 与 fire_client 一致：task-local 不跨 spawn，发送前重新 scope。
+                                let res = match region {
+                                    Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
+                                    None => sender.send_tx(&tx).await,
+                                };
+                                if let Err(e) = res {
+                                    log::error!(
+                                        "[par] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
+                                        sender,
+                                        e,
+                                        slot,
+                                        region,
+                                        tip,
+                                        sig
+                                    );
+                                }
                             });
                         }
                         Err(e) => {
-                            log::error!("[par] {} build: {}", c, e);
+                            log::error!(
+                                "[par] {} build: {} (slot={:?} region_hint={:?} tip={:?} cu={:?})",
+                                c,
+                                e,
+                                slot,
+                                region,
+                                tip,
+                                cu
+                            );
                         }
                     }
                 }));
@@ -1090,7 +1108,6 @@ async fn tip_only_harmonic<O: SlotOracle>(
         &mut sigs,
     )
     .await;
-    log::info!("[tip_only_harmonic] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_tip_only(harmonic) failed: {}", e))
@@ -1149,7 +1166,6 @@ async fn tip_only_jito<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_tip!(d.jito);
 
-    log::info!("[tip_only_jito] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_tip_only(jito) failed: {}", e))
@@ -1182,7 +1198,6 @@ async fn tip_only_fallback<O: SlotOracle>(
         &mut sigs,
     )
     .await;
-    log::info!("[tip_only_fallback] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_tip_only(fallback) failed: {}", e))
@@ -1383,7 +1398,6 @@ async fn harmonic_mode_v1<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito, tip: tip_strategy);
 
-    log::info!("[harmonic_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -1442,7 +1456,6 @@ async fn jito_mode_v1<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_v1_tip_only!(d.jito);
 
-    log::info!("[jito_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -1619,7 +1632,6 @@ async fn fallback_mode_v1<O: SlotOracle>(
     #[cfg(not(feature = "syncro"))]
     let _ = add_syncro;
 
-    log::info!("[fallback_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -1781,13 +1793,6 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
         };
     }
 
-    log::info!(
-        "[fallback_cost_mode_v1] cost={} cu_limit={} tip_rate={}",
-        config.cost,
-        config.cu_limit,
-        config.tip_rate
-    );
-
     // ── 平台组合（与 fallback_mode_v1 逐项一致，只是 tip/fee 换成 cost 语义）──
     #[cfg(feature = "everstake_quic")]
     fire_v1_with_price!(d.everstake_quic);
@@ -1838,7 +1843,6 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     #[cfg(not(feature = "syncro"))]
     let _ = add_syncro;
 
-    log::info!("[fallback_cost_mode_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -1883,7 +1887,6 @@ async fn tip_only_auto_v1<O: SlotOracle>(
     }
 
     fire_all_parallel_v1(d, ixs, ctx, tip_strategy, cfg, Some(MEMO_TAG.to_string()), false, &mut sigs).await;
-    log::info!("[tip_only_auto_v1] priority_fee={priority_fee} fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs).await
 }
 
@@ -1927,6 +1930,8 @@ async fn fire_all_parallel_v1(
                 let config = config;
                 let memo = memo.clone();
                 let sigs = sigs_shared.clone();
+                let region = crate::region_pool::current_region();
+                let slot = crate::region_pool::current_slot();
                 handles.push(tokio::spawn(async move {
                     let memo_ref: Option<&str> = memo.as_deref();
                     let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
@@ -1934,15 +1939,45 @@ async fn fire_all_parallel_v1(
                         Ok(env) => {
                             let sig = env.sig();
                             let tx = env.inner_tx().clone();
-                            log::info!("[par-v1] 🚀 {} sending {}", c, sig);
+                            log::info!(
+                                "[par-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={}",
+                                c,
+                                slot,
+                                region,
+                                tip,
+                                config,
+                                sig
+                            );
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
                             tokio::spawn(async move {
-                                let _ = sender.send_tx(&tx).await;
+                                let res = match region {
+                                    Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
+                                    None => sender.send_tx(&tx).await,
+                                };
+                                if let Err(e) = res {
+                                    log::error!(
+                                        "[par-v1] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
+                                        sender,
+                                        e,
+                                        slot,
+                                        region,
+                                        tip,
+                                        sig
+                                    );
+                                }
                             });
                         }
                         Err(e) => {
-                            log::error!("[par-v1] {} build: {}", c, e);
+                            log::error!(
+                                "[par-v1] {} build: {} (slot={:?} region_hint={:?} tip={:?} config={:?})",
+                                c,
+                                e,
+                                slot,
+                                region,
+                                tip,
+                                config
+                            );
                         }
                     }
                 }));
@@ -2041,7 +2076,6 @@ pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
     #[cfg(feature = "jito")]
     fire_v1_cheap!(d.jito);
 
-    log::info!("[dispatch_cheap_v1] fired {} tx(s)", sigs.len());
     confirm_tx(rx, sigs, timeout_secs)
         .await
         .map_err(|e| anyhow::anyhow!("send_cheap_v1 failed: {}", e))

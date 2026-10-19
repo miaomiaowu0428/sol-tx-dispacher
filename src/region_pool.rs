@@ -39,6 +39,8 @@ use crate::region_plan::RegionProfile;
 tokio::task_local! {
     /// 当前发送任务的目标入口地区，由 `fire_client` 在 spawn 时设置。
     pub static SEND_REGION: Region;
+    /// 当前发送的 target slot，仅用于日志关联（不参与路由）。
+    pub static SEND_SLOT: u64;
 }
 
 /// 当前任务的目标入口地区（没有设置 hint 时返回 `None`）。
@@ -46,9 +48,19 @@ pub fn current_region() -> Option<Region> {
     SEND_REGION.try_with(|r| *r).ok()
 }
 
+/// 当前发送的 target slot（没有设置时返回 `None`）。
+pub fn current_slot() -> Option<u64> {
+    SEND_SLOT.try_with(|s| *s).ok()
+}
+
 /// 在 `region` 的 hint 下执行 `fut`。
 pub async fn with_region<F: std::future::Future>(region: Region, fut: F) -> F::Output {
     SEND_REGION.scope(region, fut).await
+}
+
+/// 在 `slot` 的日志上下文下执行 `fut`（可与 [`with_region`] 嵌套）。
+pub async fn with_send_slot<F: std::future::Future>(slot: u64, fut: F) -> F::Output {
+    SEND_SLOT.scope(slot, fut).await
 }
 
 /// 同一平台的多地区实例池。

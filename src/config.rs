@@ -193,6 +193,9 @@ impl<O: SlotOracle> TxDispacher<O> {
             }
         }
 
-        b.build()
+        let d = b.build();
+        // 启动时把“实际构造了哪些平台 / 哪些地区”打出来，方便核对 feature 与 key。
+        d.log_channels();
+        d
     }
 }

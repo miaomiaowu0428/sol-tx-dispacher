@@ -15,6 +15,14 @@ use std::{fmt::Display, sync::Arc};
 
 use crate::context::SendContext;
 
+/// V0 的 `(cu_limit, cu_price)` → 总优先费 lamports（两项都有时才算）。
+pub(crate) fn v0_gas_lamports(cu: (Option<u32>, Option<u64>)) -> Option<u64> {
+    match cu {
+        (Some(limit), Some(price)) => Some((limit as u64).saturating_mul(price) / 1_000_000),
+        _ => None,
+    }
+}
+
 /// 对某个平台发起一次 fire-and-forget 发送，将 sig 插入 `sigs`。
 ///
 /// - `tip`：`None` 走平台最低 tip；`Some(0)` 完全不加 tip 指令。
@@ -33,10 +41,14 @@ pub fn fire_client<C>(
     C: BuildV0Tx + BuildTx + SendTx + Display + Sync + Send + 'static,
 {
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
+    let region = crate::region_pool::current_region();
+    let slot = crate::region_pool::current_slot();
+    let cu_params = *cu;
+    let gas_lamports = v0_gas_lamports(cu_params);
     let build_t0 = std::time::Instant::now();
     let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
-        match client.build_v0_tx(ixs, payer, &tip, hash_param, cu, alt, memo_vec) {
+        match client.build_v0_tx(ixs, payer, &tip, hash_param, &cu_params, alt, memo_vec) {
             Ok(env) => {
                 let sig = env.sig();
                 let tx = env.inner_tx().clone();
@@ -44,7 +56,15 @@ pub fn fire_client<C>(
                 // env dropped here → 借用释放
             }
             Err(e) => {
-                log::error!("[fire] {} build failed: {}", client, e);
+                log::error!(
+                    "[fire] {} build failed: {} (slot={:?} region_hint={:?} tip={:?} cu={:?})",
+                    client,
+                    e,
+                    slot,
+                    region,
+                    tip,
+                    cu_params
+                );
                 return;
             }
         }
@@ -53,13 +73,22 @@ pub fn fire_client<C>(
 
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
-    log::info!("[fire] 🚀 {} sending {}", client, sig);
+    log::info!(
+        "[fire] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={} build={:?}",
+        client,
+        slot,
+        region,
+        tip,
+        cu_params,
+        gas_lamports,
+        sig,
+        build_elapsed
+    );
 
     let sender = Arc::clone(client);
     let platform = client.to_string();
     // 把当前任务的目标入口地区**显式带进 spawn 出来的 task**：task-local 不会跨
     // `tokio::spawn` 继承，不重新 scope 的话 RegionPool 只会看到 None 并退回 own。
-    let region = crate::region_pool::current_region();
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
         let res = match region {
@@ -67,11 +96,19 @@ pub fn fire_client<C>(
             None => sender.send_tx(&tx).await,
         };
         if let Err(e) = res {
-            log::error!("[fire] {} send failed: {}", sender, e);
+            log::error!(
+                "[fire] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
+                sender,
+                e,
+                slot,
+                region,
+                tip,
+                sig
+            );
         }
-        // ③ 单条 log：构建耗时 + 发送耗时（发送为交给平台、不等链上确认），按 sig 可查
-        log::info!(
-            "📤 [send] platform={platform} sig={sig} 构建耗时:{build_elapsed:?} 发送耗时:{:?}",
+        // ③ 发送耗时只放 debug：info 级别每个平台只保留上面一条完整日志，避免刷屏。
+        log::debug!(
+            "📤 [send] platform={platform} slot={slot:?} region_hint={region:?} tip={tip:?} cu={cu_params:?} gas_lamports={gas_lamports:?} sig={sig} 构建耗时:{build_elapsed:?} 发送耗时:{:?}",
             send_t0.elapsed()
         );
     });
@@ -101,6 +138,8 @@ pub fn fire_v1_client<C>(
     let hash_param = &ctx.hash_param;
 
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
+    let region = crate::region_pool::current_region();
+    let slot = crate::region_pool::current_slot();
     let build_t0 = std::time::Instant::now();
     let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
@@ -112,7 +151,15 @@ pub fn fire_v1_client<C>(
                 // env dropped here → 借用释放
             }
             Err(e) => {
-                log::error!("[fire-v1] {} build failed: {}", client, e);
+                log::error!(
+                    "[fire-v1] {} build failed: {} (slot={:?} region_hint={:?} tip={:?} config={:?})",
+                    client,
+                    e,
+                    slot,
+                    region,
+                    tip,
+                    config
+                );
                 return;
             }
         }
@@ -121,11 +168,19 @@ pub fn fire_v1_client<C>(
 
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
-    log::info!("[fire-v1] 🚀 {} sending {}", client, sig);
+    log::info!(
+        "[fire-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={} build={:?}",
+        client,
+        slot,
+        region,
+        tip,
+        config,
+        sig,
+        build_elapsed
+    );
 
     let sender = Arc::clone(client);
     let platform = client.to_string();
-    let region = crate::region_pool::current_region();
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
         let res = match region {
@@ -133,10 +188,19 @@ pub fn fire_v1_client<C>(
             None => sender.send_tx(&tx).await,
         };
         if let Err(e) = res {
-            log::error!("[fire-v1] {} send failed: {}", sender, e);
+            log::error!(
+                "[fire-v1] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
+                sender,
+                e,
+                slot,
+                region,
+                tip,
+                sig
+            );
         }
-        log::info!(
-            "📤 [send-v1] platform={platform} sig={sig} 构建耗时:{build_elapsed:?} 发送耗时:{:?}",
+        // info 级别每个平台只保留上面一条完整日志；发送耗时放 debug。
+        log::debug!(
+            "📤 [send-v1] platform={platform} slot={slot:?} region_hint={region:?} tip={tip:?} config={config:?} sig={sig} 构建耗时:{build_elapsed:?} 发送耗时:{:?}",
             send_t0.elapsed()
         );
     });

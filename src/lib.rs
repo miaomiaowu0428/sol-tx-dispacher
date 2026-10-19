@@ -585,7 +585,7 @@ pub enum SendRoute {
 /// `oracle.leader_at()` 必须是**纯内存读**（`SlotLeaderCache` 的 DashMap）。
 /// DB 拉取只发生在启动时的 `refresh_once()` 和后台每 10 分钟的刷新任务里，
 /// **发送路径不查库**。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SendPlan {
     /// 本次查询的 slot。
     pub slot: u64,
@@ -593,10 +593,52 @@ pub struct SendPlan {
     pub route: SendRoute,
     /// 是否命中 FIFO leader（`(vote account, client_type_id)` 白名单）。
     pub fifo: bool,
+    /// 本次发送读到的 leader 快照（`None` = 缓存无该 slot / NoopOracle）。
+    pub leader: Option<LeaderInfo>,
     /// leader 所在地区（由 DB 的 `region` 文本经 `geo_to_region` 得到）。
     pub leader_region: Region,
     /// 实际使用的入口地区（leader 地区在 fanout 内 → 该地区；否则 own）。
     pub ingress: Region,
+}
+
+/// 一个已构造的发送通道（启动日志 / 运维自检用）。
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    /// 平台名（如 `Astralane` / `AstralaneQuic`）。
+    pub platform: &'static str,
+    /// 传输方式（`HTTP` / `QUIC` / `gRPC`）。
+    pub transport: &'static str,
+    /// 该通道实际开了哪些入口地区；空表示不按地区池发送（如 Harmonic）。
+    pub regions: Vec<Region>,
+}
+
+impl ChannelInfo {
+    fn pool<T>(platform: &'static str, transport: &'static str, pool: &RegionPool<T>) -> Self {
+        let mut regions: Vec<Region> = pool.regions().collect();
+        // HashMap 无序；按 Region::ALL 的固定顺序输出，保证日志可对比。
+        regions.sort_by_key(|r| Region::ALL.iter().position(|x| x == r).unwrap_or(usize::MAX));
+        Self {
+            platform,
+            transport,
+            regions,
+        }
+    }
+
+    fn single(platform: &'static str, transport: &'static str) -> Self {
+        Self {
+            platform,
+            transport,
+            regions: vec![*sol_tx_send::constants::REGION],
+        }
+    }
+
+    fn multi_endpoint(platform: &'static str, transport: &'static str) -> Self {
+        Self {
+            platform,
+            transport,
+            regions: Vec::new(),
+        }
+    }
 }
 
 // ── TxDispacher ───────────────────────────────────────────────────────────────
@@ -649,6 +691,34 @@ pub struct TxDispacher<O: SlotOracle> {
 fn into_tx_confirm_err(e: anyhow::Error) -> TxConfirmError {
     e.downcast::<TxConfirmError>()
         .unwrap_or_else(|e| TxConfirmError::Other(format!("{:#}", e)))
+}
+
+/// 打印一次发送的 leader 决策快照。
+///
+/// `leader` 是本次**唯一一次**缓存读取得到的完整 `LeaderInfo`，方便直接对照
+/// DB 里的 `client_type / name / leader / client_type_id / region`。
+fn log_send_plan(prefix: &str, plan: &SendPlan) {
+    log::info!(
+        "[TxDispacher] {prefix} slot={} route={:?} fifo={} leader_region={} ingress={} leader={:?}",
+        plan.slot,
+        plan.route,
+        plan.fifo,
+        plan.leader_region,
+        plan.ingress,
+        plan.leader
+    );
+}
+
+/// 在 `plan` 的 region + slot 上下文下执行发送 future。
+///
+/// - region 给 `RegionPool` 选实例；
+/// - slot 只给逐平台日志关联用，不参与路由。
+async fn with_plan_ctx<F: std::future::Future>(plan: &SendPlan, fut: F) -> F::Output {
+    crate::region_pool::with_region(
+        plan.ingress,
+        crate::region_pool::with_send_slot(plan.slot, fut),
+    )
+    .await
 }
 
 impl<O: SlotOracle> TxDispacher<O> {
@@ -710,6 +780,83 @@ impl<O: SlotOracle> TxDispacher<O> {
             senders.push(Box::new(c.as_ref().clone()));
         }
         MultiBundleSenderV1::new(senders)
+    }
+
+    /// 当前实际注册的发送通道（平台 + 传输 + 地区）。
+    ///
+    /// 只包含对应 `Option<...>` 为 `Some` 的 client；未配 key / 初始化失败的
+    /// 平台不会出现。供启动日志与运维自检使用。
+    pub fn channels(&self) -> Vec<ChannelInfo> {
+        let mut out = Vec::new();
+
+        macro_rules! push_pool {
+            ($opt:expr, $name:literal, $transport:literal) => {
+                if let Some(pool) = &$opt {
+                    out.push(ChannelInfo::pool($name, $transport, pool));
+                }
+            };
+        }
+
+        #[cfg(feature = "astralane")]
+        push_pool!(self.astralane, "Astralane", "HTTP");
+        #[cfg(feature = "astralane_quic")]
+        if self.astralane_quic.is_some() {
+            out.push(ChannelInfo::single("AstralaneQuic", "QUIC"));
+        }
+        #[cfg(feature = "everstake")]
+        push_pool!(self.everstake, "EverStake", "HTTP");
+        #[cfg(feature = "everstake_quic")]
+        if self.everstake_quic.is_some() {
+            out.push(ChannelInfo::single("EverStakeQuic", "QUIC"));
+        }
+        #[cfg(feature = "flash_block")]
+        push_pool!(self.flash_block, "FlashBlock", "HTTP");
+        #[cfg(feature = "nodeone")]
+        push_pool!(self.nodeone, "NodeOne", "HTTP");
+        #[cfg(feature = "blockrazor")]
+        push_pool!(self.blockrazor, "Blockrazor", "HTTP");
+        #[cfg(feature = "temporal")]
+        push_pool!(self.temporal, "Temporal", "HTTP");
+        #[cfg(feature = "helius")]
+        push_pool!(self.helius_max, "HeliusMax", "HTTP");
+        #[cfg(feature = "helius")]
+        push_pool!(self.helius_swqos, "HeliusSwqos", "HTTP");
+        #[cfg(feature = "zeroslot")]
+        push_pool!(self.zeroslot, "ZeroSlot", "HTTP");
+        #[cfg(feature = "nextblock")]
+        push_pool!(self.nextblock, "NextBlock", "HTTP");
+        #[cfg(feature = "stellium")]
+        push_pool!(self.stellium, "Stellium", "HTTP");
+        #[cfg(feature = "syncro")]
+        push_pool!(self.syncro, "Syncro", "HTTP");
+        #[cfg(feature = "jito")]
+        push_pool!(self.jito, "Jito", "HTTP");
+        #[cfg(feature = "landx")]
+        push_pool!(self.landx, "LandX", "HTTP");
+        #[cfg(feature = "harmonic")]
+        if self.harmonic.is_some() {
+            out.push(ChannelInfo::multi_endpoint("Harmonic", "gRPC"));
+        }
+
+        out
+    }
+
+    /// 打印启动时的通道清单。建议在 `init()` 里 `from_config` 之后调用一次。
+    pub fn log_channels(&self) {
+        let channels = self.channels();
+        if channels.is_empty() {
+            log::warn!("[TxDispacher] 没有注册任何发送通道！请检查 feature 与各平台环境变量");
+            return;
+        }
+        log::info!("[TxDispacher] 已构造 {} 个发送通道:", channels.len());
+        for c in &channels {
+            log::info!(
+                "[TxDispacher]   channel platform={} transport={} regions={:?}",
+                c.platform,
+                c.transport,
+                c.regions
+            );
+        }
     }
 
     /// 已注册 HTTP 平台的保活目标：**只包含真正注入的客户端，且覆盖池里每个地区**。
@@ -832,7 +979,7 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// 想停掉保活就 `handle.abort()`。
     pub fn spawn_keep_alive(&self) -> tokio::task::JoinHandle<()> {
         let targets = self.keep_alive_targets();
-        log::info!("[TxDispacher] keep-alive 覆盖 {} 个已注册平台", targets.len());
+        log::info!("[TxDispacher] keep-alive 覆盖 {} 个 HTTP endpoint", targets.len());
         tokio::spawn(run_keep_alive(targets))
     }
 
@@ -873,6 +1020,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             fifo: Self::fifo_for(info.as_ref()),
             leader_region,
             ingress: self.region_profile.ingress_for(leader_region),
+            leader: info,
         }
     }
 
@@ -954,27 +1102,20 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let plan = self.plan(target_slot);
+        log_send_plan("send", &plan);
+        log::info!(
+            "[TxDispacher] send mode=v0 tip_strategy={:?} cu={:?} timeout={}s",
+            tip_strategy,
+            cu,
+            confirm_timeout_secs
+        );
         // FIFO leader：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与 cu_price 竞价）。
         if plan.fifo {
-            log::info!(
-                "[TxDispacher] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → tip=None cu=(limit, None)",
-                plan.slot,
-                plan.route,
-                plan.ingress,
-                plan.leader_region
-            );
-            return crate::region_pool::with_region(plan.ingress, strategy::dispatch(self, ixs, ctx, plan.route, None, (cu.0, None), confirm_timeout_secs))
+            return with_plan_ctx(&plan, strategy::dispatch(self, ixs, ctx, plan.route, None, (cu.0, None), confirm_timeout_secs))
                 .await
                 .map_err(into_tx_confirm_err);
         }
-        log::info!(
-            "[TxDispacher] slot={} route={:?} ingress={} leader_region={}",
-            plan.slot,
-            plan.route,
-            plan.ingress,
-            plan.leader_region
-        );
-        crate::region_pool::with_region(plan.ingress, strategy::dispatch(self, ixs, ctx, plan.route, tip_strategy, cu, confirm_timeout_secs))
+        with_plan_ctx(&plan, strategy::dispatch(self, ixs, ctx, plan.route, tip_strategy, cu, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -991,6 +1132,13 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        log::info!(
+            "[TxDispacher] send_cheap mode=cheap ingress={} tip_strategy={:?} cu={:?} timeout={}s",
+            self.region_profile.own_region,
+            tip_strategy,
+            cu,
+            confirm_timeout_secs
+        );
         crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
@@ -1011,15 +1159,14 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let plan = self.plan(target_slot);
+        log_send_plan("send_tip_only", &plan);
         log::info!(
-            "[TxDispacher::send_tip_only] slot={} route={:?} ingress={} leader_region={} tip_floor={}",
-            plan.slot,
-            plan.route,
-            plan.ingress,
-            plan.leader_region,
-            min_tip_floor
+            "[TxDispacher] send_tip_only mode=tip_only tip_floor={} cu_limit={} timeout={}s",
+            min_tip_floor,
+            cu_limit,
+            confirm_timeout_secs
         );
-        crate::region_pool::with_region(plan.ingress, strategy::dispatch_tip_only(self, ixs, ctx, plan.route, min_tip_floor, cu_limit, confirm_timeout_secs))
+        with_plan_ctx(&plan, strategy::dispatch_tip_only(self, ixs, ctx, plan.route, min_tip_floor, cu_limit, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1044,18 +1191,19 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let plan = self.plan(target_slot);
+        log_send_plan("send_with_cost", &plan);
+        log::info!(
+            "[TxDispacher] send_with_cost mode=cost cost={} cu_limit={} tip_rate={} timeout={}s",
+            config.cost_amount,
+            config.cu_limit,
+            config.tip_rate,
+            confirm_timeout_secs
+        );
         // FIFO leader：不参与 tip/cu_price 竞价（靠先到先得），cost 不生效，
         // 只保留 cu_limit，tip=None、cu_price=None。
         if plan.fifo {
-            log::info!(
-                "[TxDispacher::send_with_cost] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → cost 不生效 tip=None cu=(limit, None)",
-                plan.slot,
-                plan.route,
-                plan.ingress,
-                plan.leader_region
-            );
-            return crate::region_pool::with_region(
-                plan.ingress,
+            return with_plan_ctx(
+                &plan,
                 strategy::dispatch(
                     self,
                     ixs,
@@ -1069,17 +1217,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             .await
             .map_err(into_tx_confirm_err);
         }
-        log::info!(
-            "[TxDispacher::send_with_cost] slot={} route={:?} ingress={} leader_region={} cost={} cu_limit={} tip_rate={}",
-            plan.slot,
-            plan.route,
-            plan.ingress,
-            plan.leader_region,
-            config.cost_amount,
-            config.cu_limit,
-            config.tip_rate
-        );
-        crate::region_pool::with_region(plan.ingress, strategy::dispatch_with_cost(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
+        with_plan_ctx(&plan, strategy::dispatch_with_cost(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1104,6 +1242,13 @@ impl<O: SlotOracle> TxDispacher<O> {
         config: V1TxConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
+        log::info!(
+            "[TxDispacher] send_cheap_v1 mode=cheap_v1 ingress={} tip_strategy={:?} config={:?} timeout={}s",
+            self.region_profile.own_region,
+            tip_strategy,
+            config,
+            confirm_timeout_secs
+        );
         crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
@@ -1131,26 +1276,28 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         let plan = self.plan(target_slot);
+        log_send_plan("send_v1", &plan);
         match cfg.mode {
             SpendMode::FixedTip { .. } => {
                 let tip_strategy = cfg.as_tip_strategy();
                 // 保底 gas：只在 Fallback 的 tip 竞价腿落地（其余 mode 忽略）
                 let tip_leg_gas = cfg.gas_opt();
+                log::info!(
+                    "[TxDispacher] send_v1 mode=fixed_tip tip_strategy={:?} gas={:?} fifo={} cu_limit={} loaded_accounts_data_size_limit={:?} heap_size={:?} timeout={}s",
+                    tip_strategy,
+                    tip_leg_gas,
+                    plan.fifo,
+                    cfg.cu_limit,
+                    cfg.loaded_accounts_data_size_limit,
+                    cfg.heap_size,
+                    confirm_timeout_secs
+                );
                 // FIFO leader：**tip 原样给，但不给 gas**（gas 固定 0）。
                 //
                 // ⚠️ 2026-09-23 策略组改了 FIFO 的定义 —— 旧口径是「不参与竞价」
                 //    （tip=None），现在改成「照常给 tip，只是不额外付 gas」。
-                if plan.fifo {
-                    log::info!(
-                        "[TxDispacher::send_v1] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → tip 原样、gas=0",
-                        plan.slot,
-                        plan.route,
-                        plan.ingress,
-                        plan.leader_region
-                    );
-                }
-                crate::region_pool::with_region(
-                    plan.ingress,
+                with_plan_ctx(
+                    &plan,
                     strategy::dispatch_v1(
                         self,
                         ixs,
@@ -1167,13 +1314,10 @@ impl<O: SlotOracle> TxDispacher<O> {
             }
             SpendMode::Cost(cost) => {
                 log::info!(
-                    "[TxDispacher::send_v1] slot={} route={:?} ingress={} leader_region={} mode=Cost cost={cost} cu_limit={} tip_rate={}",
-                    plan.slot,
-                    plan.route,
-                    plan.ingress,
-                    plan.leader_region,
+                    "[TxDispacher] send_v1 mode=cost cost={cost} cu_limit={} tip_rate={} timeout={}s",
                     cfg.cu_limit,
-                    cfg.tip_rate
+                    cfg.tip_rate,
+                    confirm_timeout_secs
                 );
                 self.send_with_cost_v1(ixs, ctx, plan, cfg.as_cost_tx_config(), confirm_timeout_secs)
                     .await
@@ -1197,14 +1341,8 @@ impl<O: SlotOracle> TxDispacher<O> {
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         // FIFO leader：不参与竞价，cost 不生效（priority_fee=None 且不给 tip）
         if plan.fifo {
-            log::info!(
-                "[TxDispacher::send_with_cost_v1] slot={} route={:?} ingress={} 命中 FIFO leader → cost 不生效",
-                plan.slot,
-                plan.route,
-                plan.ingress
-            );
-            return crate::region_pool::with_region(
-                plan.ingress,
+            return with_plan_ctx(
+                &plan,
                 strategy::dispatch_v1(
                     self,
                     ixs,
@@ -1224,7 +1362,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             .await
             .map_err(into_tx_confirm_err);
         }
-        crate::region_pool::with_region(plan.ingress, strategy::dispatch_with_cost_v1(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
+        with_plan_ctx(&plan, strategy::dispatch_with_cost_v1(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1564,6 +1702,27 @@ mod tests {
                 "缺少 {needle}: {targets:?}"
             );
         }
+    }
+
+    /// 启动日志的数据源：`channels()` 必须报告平台、传输方式和实际地区。
+    #[cfg(feature = "astralane")]
+    #[test]
+    fn channels_reports_platform_transport_and_regions() {
+        use sol_tx_send::platform_clients::astralane::Astralane;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(NoopOracle)
+            .region_profile(profile.clone())
+            .astralane_pool(RegionPool::build(&profile, |r| Astralane::init_with("k", r)))
+            .build();
+
+        let channels = d.channels();
+        let a = channels.iter().find(|c| c.platform == "Astralane").expect("应有 Astralane");
+        assert_eq!(a.transport, "HTTP");
+        assert_eq!(a.regions, vec![Region::Frankfurt, Region::Amsterdam]);
     }
 
     /// 退化到同一 endpoint 的目标地区必须去重，否则同一个 origin 被 ping 多次。

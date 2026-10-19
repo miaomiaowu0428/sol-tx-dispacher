@@ -240,10 +240,16 @@ tokio::spawn(async move { with_region(r, pool.send_tx(&tx)).await });
 | 日志 | 含义 |
 |---|---|
 | `[TxDispacher] 地区计划：own=... fanout=[...]` | 启动时选中的 profile |
-| `[fire] 🚀 <client> sending <sig>` | 某平台已构建并发起发送；`<client>` 形如 `Astralane[4x]` 表示多地区池 |
-| `📤 [send] platform=... 构建耗时 / 发送耗时` | 单平台耗时，排查慢平台 |
-| `[fallback_mode] fired N tx(s)` | 本轮实际发起的平台数 |
+| `[TxDispacher] 已构造 N 个发送通道` + `channel platform=... transport=... regions=[...]` | 启动时真正注册的平台 / 传输 / 每个池开了哪些地区 |
+| `[TxDispacher] send... slot=... route=... fifo=... leader_region=... ingress=... leader=...` | 每次发送的 leader 快照（唯一一次缓存读取）与路由/入口地区 |
+| `send... mode=... tip_strategy=... cu=... / cost=...` | 本次发送模式与入参（V0 / FixedTip / Cost / tip_only / cheap） |
+| `[fire] 🚀 <client> slot=... region_hint=... tip=... cu=... gas_lamports=... sig=... build=...` | **info 级别每平台一行**：构建参数 + 签名；`<client>` 形如 `Astralane[4x]` |
+| `[fire-v1] 🚀 <client> slot=... region_hint=... tip=... config=... sig=...` | V1 单平台参数（`priority_fee` 已是 lamports 总额，含 cu_limit / loaded / heap） |
+| `[par]` / `[par-v1]` 同上 | 并行 fire 路径的单平台完整参数 + 签名 |
+| `📤 [send] / [send-v1] ... 发送耗时` | **debug**：发送耗时，排查慢平台；info 不打印，避免刷屏 |
 | `[keep-alive] <平台> <url> -> <状态> (<ms>)` | 保活探测；>50ms 会 warn |
 | `[RegionPlan] 没有 own_region=... 的 profile` | `REGION` 与配置对不上，退化成单地区 |
 
-**排查顺序**：先看 `地区计划` 是否符合预期 → 看 `fired N`（平台是否注册）→ 看 `send failed`（凭据/端点）→ 看 `keep-alive` 是否慢。
+`region_hint` 是 dispatcher 在入口设置的地区；单地区 client（QUIC / Harmonic）会忽略它，多地区池会按它选实例。旧的一批 `fired N tx(s)` / 重复的 `sending <sig>` 汇总日志已移除，info 级别每个平台只保留一条完整日志。
+
+**排查顺序**：先看 `已构造 N 个发送通道` 是否符合预期 → 看每次 `send slot/route/leader/ingress` → 按 `sig` 查 `[fire]` 的平台/tip/cu/config → 看 `send failed`（凭据/端点）→ 需要时开 debug 看发送耗时 → 看 `keep-alive` 是否慢。
