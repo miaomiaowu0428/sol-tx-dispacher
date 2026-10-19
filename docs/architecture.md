@@ -178,7 +178,7 @@ tokio::spawn(async move { with_region(r, pool.send_tx(&tx)).await });
 
 | 平台 | 参与 fanout | 传输 | 备注 |
 |---|---|---|---|
-| Astralane / AstralaneQuic | ✅ / ❌ | HTTP / QUIC | 11 个地区；QUIC 单地区 |
+| Astralane / AstralaneQuic | ✅ / ❌ | HTTP / QUIC | 11 个地区；QUIC 单地区；两者独立，都开则双发 |
 | Temporal | ✅ | HTTP | 无 Limburg/Lithuania |
 | NodeOne | ✅ | HTTP | 8 地区 |
 | Blockrazor | ✅ | HTTP | 仅 FRA/NY/TYO/AMS |
@@ -189,7 +189,7 @@ tokio::spawn(async move { with_region(r, pool.send_tx(&tx)).await });
 | HeliusMax / HeliusSwqos | ✅ | HTTP | 同一 key；保活用官方 `/ping` |
 | LandX | ✅ | HTTP | 官方 `/ping` 做保活 |
 | Syncro | ✅ | HTTP | 仅 `P2pTurbo` 路由；无 key 不注册 |
-| EverStake / EverStakeQuic | ✅ / ❌ | HTTP / QUIC | 无需 key |
+| EverStake / EverStakeQuic | ✅ / ❌ | HTTP / QUIC | 无需 key；两者独立，都开则双发 |
 | Harmonic | ❌ | gRPC | 多端点并发广播 |
 
 ## 8. 配置与环境变量

@@ -366,7 +366,7 @@ async fn jito_mode<O: SlotOracle>(
     // 只发带 tip 的版本：fire_both 平台取 no_price 那笔，fire_with_price 平台跳过
     #[cfg(feature = "astralane_quic")]
     fire_tip_only!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_tip_only!(d.astralane);
 
     #[cfg(feature = "flash_block")]
@@ -505,8 +505,8 @@ async fn fallback_mode<O: SlotOracle>(
     #[cfg(feature = "everstake_quic")]
     fire_with_price!(d.everstake_quic, tip: Some(TipStrategy::Ratio(1.05)));
 
-    // everstake_quic 开启时 HTTP 版自动跳过，quic 未开启时按 feature 决定
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    // everstake 与 everstake_quic 相互独立：各自 feature 打开就发，不做互斥
+    #[cfg(feature = "everstake")]
     fire_with_price!(d.everstake, tip: Some(TipStrategy::Ratio(1.05)));
 
     #[cfg(feature = "astralane_quic")]
@@ -515,8 +515,8 @@ async fn fallback_mode<O: SlotOracle>(
         no_price:   tip_strategy,
     );
 
-    // astralane_quic 开启时 HTTP 版自动跳过，quic 未开启时按 feature 决定
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    // astralane 与 astralane_quic 相互独立：各自 feature 打开就发，不做互斥
+    #[cfg(feature = "astralane")]
     fire_both!(d.astralane,
         with_price: Some(TipStrategy::Ratio(1.05)),
         no_price:   tip_strategy,
@@ -716,12 +716,12 @@ async fn fallback_cost_mode<O: SlotOracle>(
     // ── 平台组合（与 fallback_mode 一致，只是 tip 值换成 cost 语义） ─────
     #[cfg(feature = "everstake_quic")]
     fire_with_price!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     fire_with_price!(d.everstake);
 
     #[cfg(feature = "astralane_quic")]
     fire_both!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_both!(d.astralane);
 
     #[cfg(feature = "flash_block")]
@@ -807,13 +807,13 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
         };
     }
 
-    // QUIC 优先；有 QUIC 时对应 HTTP 版自动跳过
+    // QUIC / HTTP 各自独立：对应 feature 打开就发（两者都开则双通道）
     #[cfg(feature = "everstake_quic")]
     fire_cheap!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     fire_cheap!(d.everstake);
 
-    // Astralane：QUIC 与普通版一起发（两者都开时双通道，只开一个时发对应通道）
+    // Astralane：QUIC 与普通版各自独立，对应 feature 打开就发
     #[cfg(feature = "astralane_quic")]
     fire_cheap!(d.astralane_quic);
     #[cfg(feature = "astralane")]
@@ -989,11 +989,11 @@ async fn fire_all_parallel(
 
     #[cfg(feature = "everstake_quic")]
     spawn_fire!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     spawn_fire!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     spawn_fire!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     spawn_fire!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire!(d.flash_block);
@@ -1137,7 +1137,7 @@ async fn tip_only_jito<O: SlotOracle>(
     // Jito 模式：只发 tip-capable 平台
     #[cfg(feature = "astralane_quic")]
     fire_tip!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_tip!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_tip!(d.flash_block);
@@ -1430,7 +1430,7 @@ async fn jito_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_tip_only!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_v1_tip_only!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_v1_tip_only!(d.flash_block);
@@ -1554,7 +1554,7 @@ async fn fallback_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "everstake_quic")]
     fire_v1_with_price!(d.everstake_quic, tip: with_price_tip);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     fire_v1_with_price!(d.everstake, tip: with_price_tip);
 
     #[cfg(feature = "astralane_quic")]
@@ -1562,7 +1562,7 @@ async fn fallback_mode_v1<O: SlotOracle>(
         with_price: with_price_tip,
         no_price:   tip_strategy,
     );
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_v1_both!(d.astralane,
         with_price: with_price_tip,
         no_price:   tip_strategy,
@@ -1791,12 +1791,12 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     // ── 平台组合（与 fallback_mode_v1 逐项一致，只是 tip/fee 换成 cost 语义）──
     #[cfg(feature = "everstake_quic")]
     fire_v1_with_price!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     fire_v1_with_price!(d.everstake);
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_both!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_v1_both!(d.astralane);
 
     #[cfg(feature = "flash_block")]
@@ -1952,11 +1952,11 @@ async fn fire_all_parallel_v1(
 
     #[cfg(feature = "everstake_quic")]
     spawn_fire_v1!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     spawn_fire_v1!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     spawn_fire_v1!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     spawn_fire_v1!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire_v1!(d.flash_block);
@@ -2030,11 +2030,11 @@ pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
 
     #[cfg(feature = "everstake_quic")]
     fire_v1_cheap!(d.everstake_quic);
-    #[cfg(all(feature = "everstake", not(feature = "everstake_quic")))]
+    #[cfg(feature = "everstake")]
     fire_v1_cheap!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     fire_v1_cheap!(d.astralane_quic);
-    #[cfg(all(feature = "astralane", not(feature = "astralane_quic")))]
+    #[cfg(feature = "astralane")]
     fire_v1_cheap!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_v1_cheap!(d.flash_block);
