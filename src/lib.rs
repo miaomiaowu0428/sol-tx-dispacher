@@ -41,7 +41,7 @@ pub use context::{SendContext, merge_alts};
 
 use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
-use sol_slot_leader::SlotOracle;
+use sol_slot_leader::{LeaderInfo, SlotOracle};
 use sol_tx_send::platform_clients::{BundleSender, KeepAliveTarget, V1TxConfig, run_keep_alive};
 use sol_tx_send::platform_clients::Region;
 use std::sync::Arc;
@@ -545,7 +545,7 @@ use sol_tx_send::platform_clients::zeroslot::ZeroSlot;
 // ── 发送路由决策 ──────────────────────────────────────────────────────────────
 
 /// 根据 oracle 查询结果得出的路由决策。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendRoute {
     /// Harmonic 系节点出块：走 Harmonic 直发 + Astralane/Temporal 90% tip
     ///
@@ -564,6 +564,39 @@ pub enum SendRoute {
     P2pTurbo,
     /// 其他所有节点（含 DB 无记录 / NoopOracle）：退化到 send_fast
     Fallback,
+}
+
+/// 一次发送所需的全部 leader 决策 —— **只读一次 oracle 缓存**。
+///
+/// # 为什么要有这个类型
+///
+/// `route` / FIFO / ingress 都来自同一条 `LeaderInfo`。历史上它们是三个独立
+/// 方法、各自调一次 `oracle.leader_at()`：
+///
+/// - 一次发送要读 3 次缓存（Cost 路径甚至 6 次）；
+/// - 如果后台刷新任务恰好在两次读取之间更新了该 slot，route 和 ingress
+///   可能来自不同快照。
+///
+/// 现在由 [`TxDispacher::plan`] 一次取出 `LeaderInfo` 并派生全部字段，发送路径
+/// 只使用这一个 `SendPlan`。
+///
+/// # 数据来源
+///
+/// `oracle.leader_at()` 必须是**纯内存读**（`SlotLeaderCache` 的 DashMap）。
+/// DB 拉取只发生在启动时的 `refresh_once()` 和后台每 10 分钟的刷新任务里，
+/// **发送路径不查库**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendPlan {
+    /// 本次查询的 slot。
+    pub slot: u64,
+    /// 路由决策。
+    pub route: SendRoute,
+    /// 是否命中 FIFO leader（`(vote account, client_type_id)` 白名单）。
+    pub fifo: bool,
+    /// leader 所在地区（由 DB 的 `region` 文本经 `geo_to_region` 得到）。
+    pub leader_region: Region,
+    /// 实际使用的入口地区（leader 地区在 fanout 内 → 该地区；否则 own）。
+    pub ingress: Region,
 }
 
 // ── TxDispacher ───────────────────────────────────────────────────────────────
@@ -820,57 +853,81 @@ impl<O: SlotOracle> TxDispacher<O> {
         sigs.into_iter().next()
     }
 
-    /// 本次发送应使用哪个入口地区的 client。
+    /// 只读一次 leader 缓存，派生本次发送的全部决策。
     ///
-    /// `leader 地区 ∈ fanout` → 用该地区（就近）；否则回退 `own_region`
-    /// （跨洲 leader 由平台内部路由）。
-    pub fn ingress_for(&self, slot: u64) -> Region {
-        let leader_region = self
-            .oracle
-            .leader_at(slot)
-            .and_then(|info| info.region)
-            .as_deref()
+    /// 这是发送路径唯一允许调用 `oracle.leader_at()` 的地方；[`Self::resolve_route`] /
+    /// [`Self::ingress_for`] 等公开查询也复用它，避免同一 slot 多次读取。
+    ///
+    /// `leader_at` 是同步内存缓存读（见 [`sol_slot_leader::SlotLeaderCache`]），
+    /// 不会在这里查 DB；DB 数据由 oracle 的后台刷新任务预先载入。
+    pub fn plan(&self, target_slot: u64) -> SendPlan {
+        let info = self.oracle.leader_at(target_slot);
+        let leader_region = info
+            .as_ref()
+            .and_then(|i| i.region.as_deref())
             .map(region_plan::geo_to_region)
             .unwrap_or(Region::Unknown);
-        self.region_profile.ingress_for(leader_region)
+        SendPlan {
+            slot: target_slot,
+            route: Self::route_for(info.as_ref()),
+            fifo: Self::fifo_for(info.as_ref()),
+            leader_region,
+            ingress: self.region_profile.ingress_for(leader_region),
+        }
     }
 
-    /// 查询当前 slot 的路由决策（不发送）。
-    /// 查询 `target_slot` 的 leader 类型并返回路由决策。
-    /// 调用方自行决定传当前 slot 还是 current_slot + N。
-    pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
-        let info = self.oracle.leader_at(target_slot);
-        // 1. 先按具体 leader pubkey 匹配 tip-only 白名单
-        if let Some(ref info) = info {
+    /// 纯函数：`LeaderInfo` → route（不查 oracle）。
+    fn route_for(info: Option<&LeaderInfo>) -> SendRoute {
+        if let Some(info) = info {
+            // 1. 先按具体 leader pubkey 匹配 tip-only 白名单
             if let Some(pk) = info.leader_pubkey() {
                 if TIP_ONLY_LEADERS.contains(pk) {
                     return SendRoute::TipOnly;
                 }
             }
-        }
-        // 2. P2P.org Turbo：在 fallback 广播之外追加 Syncro 通道
-        if let Some(ref info) = info {
+            // 2. P2P.org Turbo：在 fallback 广播之外追加 Syncro 通道
             if info.is_p2p_turbo() {
                 return SendRoute::P2pTurbo;
             }
+            // 3. 再按客户端类型匹配
+            if info.is_harmonic() {
+                return SendRoute::Harmonic;
+            }
+            if info.is_jito() {
+                return SendRoute::Jito;
+            }
         }
-        // 3. 再按客户端类型匹配
-        match info {
-            Some(info) if info.is_harmonic() => SendRoute::Harmonic,
-            Some(info) if info.is_jito() => SendRoute::Jito,
-            _ => SendRoute::Fallback,
-        }
+        SendRoute::Fallback
     }
 
-    /// 目标 slot 的 leader 是否命中 FIFO 表（leader vote account + client_type_id 都匹配）。
-    /// FIFO leader 命中时：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与竞价）。
-    fn is_fifo_leader(&self, slot: u64) -> bool {
-        if let Some(info) = self.oracle.leader_at(slot) {
+    /// 纯函数：`LeaderInfo` → 是否 FIFO（不查 oracle）。
+    fn fifo_for(info: Option<&LeaderInfo>) -> bool {
+        if let Some(info) = info {
             if let (Some(pk), Some(ctid)) = (info.leader_pubkey().copied(), info.client_type_id) {
                 return FIFO_LEADERS.contains(&(pk, ctid));
             }
         }
         false
+    }
+
+    /// 本次发送应使用哪个入口地区的 client。
+    ///
+    /// `leader 地区 ∈ fanout` → 用该地区（就近）；否则回退 `own_region`
+    /// （跨洲 leader 由平台内部路由）。
+    ///
+    /// ⚠️ 这是一次**独立**的缓存读取（`plan` 会顺带算 route/fifo）。发送路径
+    /// 内部不再调它，而是复用同一个 [`SendPlan`]。
+    pub fn ingress_for(&self, slot: u64) -> Region {
+        self.plan(slot).ingress
+    }
+
+    /// 查询当前 slot 的路由决策（不发送）。
+    /// 查询 `target_slot` 的 leader 类型并返回路由决策。
+    /// 调用方自行决定传当前 slot 还是 current_slot + N。
+    ///
+    /// ⚠️ 与 `ingress_for` 相同：这是独立查询；发送路径内部复用 [`SendPlan`]。
+    pub fn resolve_route(&self, target_slot: u64) -> SendRoute {
+        self.plan(target_slot).route
     }
 
     /// 主发送入口。
@@ -896,20 +953,28 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
+        let plan = self.plan(target_slot);
         // FIFO leader：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与 cu_price 竞价）。
-        if self.is_fifo_leader(target_slot) {
+        if plan.fifo {
             log::info!(
-                "[TxDispacher] slot={} route={:?} 命中 FIFO leader → tip=None cu=(limit, None)",
-                target_slot,
-                route
+                "[TxDispacher] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → tip=None cu=(limit, None)",
+                plan.slot,
+                plan.route,
+                plan.ingress,
+                plan.leader_region
             );
-            return crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch(self, ixs, ctx, route, None, (cu.0, None), confirm_timeout_secs))
+            return crate::region_pool::with_region(plan.ingress, strategy::dispatch(self, ixs, ctx, plan.route, None, (cu.0, None), confirm_timeout_secs))
                 .await
                 .map_err(into_tx_confirm_err);
         }
-        log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
-        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs))
+        log::info!(
+            "[TxDispacher] slot={} route={:?} ingress={} leader_region={}",
+            plan.slot,
+            plan.route,
+            plan.ingress,
+            plan.leader_region
+        );
+        crate::region_pool::with_region(plan.ingress, strategy::dispatch(self, ixs, ctx, plan.route, tip_strategy, cu, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -945,14 +1010,16 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu_limit: u32,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
+        let plan = self.plan(target_slot);
         log::info!(
-            "[TxDispacher::send_tip_only] slot={} route={:?} tip_floor={}",
-            target_slot,
-            route,
+            "[TxDispacher::send_tip_only] slot={} route={:?} ingress={} leader_region={} tip_floor={}",
+            plan.slot,
+            plan.route,
+            plan.ingress,
+            plan.leader_region,
             min_tip_floor
         );
-        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs))
+        crate::region_pool::with_region(plan.ingress, strategy::dispatch_tip_only(self, ixs, ctx, plan.route, min_tip_floor, cu_limit, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -976,22 +1043,24 @@ impl<O: SlotOracle> TxDispacher<O> {
         config: CostConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
+        let plan = self.plan(target_slot);
         // FIFO leader：不参与 tip/cu_price 竞价（靠先到先得），cost 不生效，
         // 只保留 cu_limit，tip=None、cu_price=None。
-        if self.is_fifo_leader(target_slot) {
+        if plan.fifo {
             log::info!(
-                "[TxDispacher::send_with_cost] slot={} route={:?} 命中 FIFO leader → cost 不生效 tip=None cu=(limit, None)",
-                target_slot,
-                route
+                "[TxDispacher::send_with_cost] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → cost 不生效 tip=None cu=(limit, None)",
+                plan.slot,
+                plan.route,
+                plan.ingress,
+                plan.leader_region
             );
             return crate::region_pool::with_region(
-                self.ingress_for(target_slot),
+                plan.ingress,
                 strategy::dispatch(
                     self,
                     ixs,
                     ctx,
-                    route,
+                    plan.route,
                     None,
                     (Some(config.cu_limit), None),
                     confirm_timeout_secs,
@@ -1001,14 +1070,16 @@ impl<O: SlotOracle> TxDispacher<O> {
             .map_err(into_tx_confirm_err);
         }
         log::info!(
-            "[TxDispacher::send_with_cost] slot={} route={:?} cost={} cu_limit={} tip_rate={}",
-            target_slot,
-            route,
+            "[TxDispacher::send_with_cost] slot={} route={:?} ingress={} leader_region={} cost={} cu_limit={} tip_rate={}",
+            plan.slot,
+            plan.route,
+            plan.ingress,
+            plan.leader_region,
             config.cost_amount,
             config.cu_limit,
             config.tip_rate
         );
-        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_with_cost(self, ixs, ctx, route, config, confirm_timeout_secs))
+        crate::region_pool::with_region(plan.ingress, strategy::dispatch_with_cost(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1059,7 +1130,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         cfg: SpendConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
+        let plan = self.plan(target_slot);
         match cfg.mode {
             SpendMode::FixedTip { .. } => {
                 let tip_strategy = cfg.as_tip_strategy();
@@ -1069,23 +1140,25 @@ impl<O: SlotOracle> TxDispacher<O> {
                 //
                 // ⚠️ 2026-09-23 策略组改了 FIFO 的定义 —— 旧口径是「不参与竞价」
                 //    （tip=None），现在改成「照常给 tip，只是不额外付 gas」。
-                let is_fifo = self.is_fifo_leader(target_slot);
-                if is_fifo {
+                if plan.fifo {
                     log::info!(
-                        "[TxDispacher::send_v1] slot={} route={route:?} 命中 FIFO leader → tip 原样、gas=0",
-                        target_slot
+                        "[TxDispacher::send_v1] slot={} route={:?} ingress={} leader_region={} 命中 FIFO leader → tip 原样、gas=0",
+                        plan.slot,
+                        plan.route,
+                        plan.ingress,
+                        plan.leader_region
                     );
                 }
                 crate::region_pool::with_region(
-                    self.ingress_for(target_slot),
+                    plan.ingress,
                     strategy::dispatch_v1(
                         self,
                         ixs,
                         ctx,
-                        route,
+                        plan.route,
                         tip_strategy,
                         cfg.as_tip_config(),
-                        if is_fifo { None } else { tip_leg_gas },
+                        if plan.fifo { None } else { tip_leg_gas },
                         confirm_timeout_secs,
                     ),
                 )
@@ -1094,11 +1167,15 @@ impl<O: SlotOracle> TxDispacher<O> {
             }
             SpendMode::Cost(cost) => {
                 log::info!(
-                    "[TxDispacher::send_v1] slot={} route={route:?} mode=Cost cost={cost} cu_limit={}",
-                    target_slot,
-                    cfg.cu_limit
+                    "[TxDispacher::send_v1] slot={} route={:?} ingress={} leader_region={} mode=Cost cost={cost} cu_limit={} tip_rate={}",
+                    plan.slot,
+                    plan.route,
+                    plan.ingress,
+                    plan.leader_region,
+                    cfg.cu_limit,
+                    cfg.tip_rate
                 );
-                self.send_with_cost_v1(ixs, ctx, target_slot, cfg.as_cost_tx_config(), confirm_timeout_secs)
+                self.send_with_cost_v1(ixs, ctx, plan, cfg.as_cost_tx_config(), confirm_timeout_secs)
                     .await
             }
         }
@@ -1107,29 +1184,32 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// V1 版 cost 语义发送（**内部用**，外部统一走 [`Self::send_v1`]）。
     ///
     /// 单预算 `cost`，按 route 分派到各 `*_cost_mode_v1`，由后者决定落地通道。
+    ///
+    /// `plan` 由 `send_v1` 传入 —— 这里**不再**重新查 oracle / 重算 route/FIFO/ingress，
+    /// 保证同一次发送只读一次 leader 缓存。
     pub(crate) async fn send_with_cost_v1(
         &self,
         ixs: &[solana_sdk::instruction::Instruction],
         ctx: &SendContext,
-        target_slot: u64,
+        plan: SendPlan,
         config: CostTxConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        let route = self.resolve_route(target_slot);
         // FIFO leader：不参与竞价，cost 不生效（priority_fee=None 且不给 tip）
-        if self.is_fifo_leader(target_slot) {
+        if plan.fifo {
             log::info!(
-                "[TxDispacher::send_with_cost_v1] slot={} route={:?} 命中 FIFO leader → cost 不生效",
-                target_slot,
-                route
+                "[TxDispacher::send_with_cost_v1] slot={} route={:?} ingress={} 命中 FIFO leader → cost 不生效",
+                plan.slot,
+                plan.route,
+                plan.ingress
             );
             return crate::region_pool::with_region(
-                self.ingress_for(target_slot),
+                plan.ingress,
                 strategy::dispatch_v1(
                     self,
                     ixs,
                     ctx,
-                    route,
+                    plan.route,
                     None,
                     // FIFO 下只需 cu_limit，priority_fee 置 None
                     sol_tx_send::platform_clients::V1TxConfig {
@@ -1144,15 +1224,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             .await
             .map_err(into_tx_confirm_err);
         }
-        log::info!(
-            "[TxDispacher::send_with_cost_v1] slot={} route={:?} cost={} cu_limit={} tip_rate={}",
-            target_slot,
-            route,
-            config.cost,
-            config.cu_limit,
-            config.tip_rate
-        );
-        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_with_cost_v1(self, ixs, ctx, route, config, confirm_timeout_secs))
+        crate::region_pool::with_region(plan.ingress, strategy::dispatch_with_cost_v1(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1177,8 +1249,9 @@ mod tests {
     use super::*;
     use sol_slot_leader::{ClientType, LeaderInfo, NoopOracle, SlotOracle};
     use sol_tx_send::platform_clients::{HashParam, Region};
-    use solana_sdk::{hash::Hash, signature::Keypair};
+    use solana_sdk::{hash::Hash, pubkey, signature::Keypair};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── 测试用 MockOracle ─────────────────────────────────────────────────────
 
@@ -1203,6 +1276,188 @@ mod tests {
                 region: self.region.map(str::to_string),
             })
         }
+    }
+
+    /// 记录 `leader_at` 调用次数的 oracle，用来锁住「一次发送只读一次缓存」。
+    struct CountingOracle {
+        calls: AtomicUsize,
+        info: Option<LeaderInfo>,
+    }
+
+    impl CountingOracle {
+        fn new(info: Option<LeaderInfo>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                info,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SlotOracle for CountingOracle {
+        fn leader_at(&self, _slot: u64) -> Option<LeaderInfo> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.info.clone()
+        }
+    }
+
+    /// 每次调用返回不同快照；用来证明 `plan` 的 route/FIFO/ingress 全部来自同一次读取。
+    struct SequenceOracle {
+        calls: AtomicUsize,
+        first: LeaderInfo,
+        second: LeaderInfo,
+    }
+
+    impl SlotOracle for SequenceOracle {
+        fn leader_at(&self, _slot: u64) -> Option<LeaderInfo> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(if n == 0 { self.first.clone() } else { self.second.clone() })
+        }
+    }
+
+    fn info(
+        client_type: ClientType,
+        name: Option<&str>,
+        leader: Option<solana_sdk::pubkey::Pubkey>,
+        client_type_id: Option<u16>,
+        region: Option<&str>,
+    ) -> LeaderInfo {
+        LeaderInfo {
+            client_type,
+            name: name.map(str::to_string),
+            leader,
+            client_type_id,
+            region: region.map(str::to_string),
+        }
+    }
+
+    // ── SendPlan：每次发送只读一次 leader 缓存 ────────────────────────────────
+
+    /// `plan` 只调一次 `leader_at`，并一次性派生 route / FIFO / leader_region / ingress。
+    #[test]
+    fn plan_reads_leader_cache_once() {
+        let oracle = CountingOracle::new(Some(info(
+            ClientType::HarmonicAgave,
+            Some("Harmonic-SG"),
+            None,
+            None,
+            Some("The Netherlands / Amsterdam"),
+        )));
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(oracle).region_profile(profile).build();
+
+        let plan = d.plan(123);
+        assert_eq!(plan.slot, 123);
+        assert_eq!(plan.route, SendRoute::Harmonic);
+        assert_eq!(plan.leader_region, Region::Amsterdam);
+        assert_eq!(plan.ingress, Region::Amsterdam);
+        assert!(!plan.fifo);
+        assert_eq!(d.oracle.calls(), 1, "一次 plan 只能读一次 oracle");
+    }
+
+    /// route 与 ingress 必须来自**同一条** LeaderInfo；不能各查一次。
+    #[test]
+    fn plan_uses_one_snapshot_for_route_and_ingress() {
+        let oracle = SequenceOracle {
+            calls: AtomicUsize::new(0),
+            first: info(
+                ClientType::HarmonicAgave,
+                Some("Harmonic-SG"),
+                None,
+                None,
+                Some("The Netherlands / Amsterdam"),
+            ),
+            second: info(ClientType::JitoLabs, None, None, None, Some("Japan / Tokyo")),
+        };
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(oracle).region_profile(profile).build();
+
+        let plan = d.plan(1);
+        // 如果 route / ingress 分开查，第二次会读到 Jito/Tokyo，ingress 会变成 own。
+        assert_eq!(plan.route, SendRoute::Harmonic);
+        assert_eq!(plan.leader_region, Region::Amsterdam);
+        assert_eq!(plan.ingress, Region::Amsterdam);
+        assert_eq!(d.oracle.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// FIFO 与 route 也来自同一个快照。
+    #[test]
+    fn plan_detects_fifo_from_the_same_snapshot() {
+        let oracle = CountingOracle::new(Some(info(
+            ClientType::Agave,
+            None,
+            Some(pubkey!("q9XWcZ7T1wP4bW9SB4XgNNwjnFEJ982nE8aVbbNuwot")),
+            Some(1),
+            Some("Germany / Frankfurt am Main"),
+        )));
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(oracle).region_profile(profile).build();
+
+        let plan = d.plan(1);
+        assert!(plan.fifo, "q9... + client_type_id=1 应命中 FIFO");
+        assert_eq!(plan.route, SendRoute::Fallback);
+        assert_eq!(plan.ingress, Region::Frankfurt);
+        assert_eq!(d.oracle.calls(), 1);
+    }
+
+    /// 公开查询 `resolve_route` / `ingress_for` 各自也只读一次缓存。
+    #[test]
+    fn public_queries_each_read_cache_once() {
+        let d = TxDispacher::builder(CountingOracle::new(None)).build();
+        let _ = d.resolve_route(1);
+        assert_eq!(d.oracle.calls(), 1);
+        let _ = d.ingress_for(1);
+        assert_eq!(d.oracle.calls(), 2);
+    }
+
+    fn empty_ctx() -> SendContext {
+        SendContext::new(
+            Arc::new(Keypair::new()),
+            HashParam::Blockhash(Hash::new_unique()),
+            Arc::new(Vec::new()),
+        )
+    }
+
+    /// V0 发送：一次 send 只读一次 leader 缓存。
+    #[tokio::test]
+    async fn send_reads_leader_cache_once() {
+        let d = TxDispacher::builder(CountingOracle::new(None)).build();
+        let _ = d
+            .send(&[], &empty_ctx(), 1, None, (Some(100_000), None), 0)
+            .await;
+        assert_eq!(d.oracle.calls(), 1);
+    }
+
+    /// V1 Cost 路径历史上会 `send_v1` + `send_with_cost_v1` 各查一轮；现在必须只查一次。
+    #[tokio::test]
+    async fn cost_send_reads_leader_cache_once() {
+        let d = TxDispacher::builder(CountingOracle::new(None)).build();
+        let _ = d
+            .send_v1(&[], &empty_ctx(), 1, SpendConfig::cost(1_000, 100_000), 0)
+            .await;
+        assert_eq!(d.oracle.calls(), 1, "Cost 路径不能二次查 oracle");
+    }
+
+    /// TipOnly 路径同样只读一次。
+    #[tokio::test]
+    async fn tip_only_send_reads_leader_cache_once() {
+        let d = TxDispacher::builder(CountingOracle::new(None)).build();
+        let _ = d
+            .send_tip_only(&[], &empty_ctx(), 1, 5_000, 100_000, 0)
+            .await;
+        assert_eq!(d.oracle.calls(), 1);
     }
 
     // ── resolve_route 单元测试 ────────────────────────────────────────────────

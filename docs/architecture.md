@@ -30,7 +30,7 @@ sol-tx-dispacher ──► sol-tx-send      平台客户端（endpoint / 保活 
 
 | 文件 | 职责 |
 |---|---|
-| `lib.rs` | 门面：`SendRoute`、`resolve_route`、`ingress_for`、`send*` 系列、`keep_alive_targets` |
+| `lib.rs` | 门面：`SendRoute` / `SendPlan`、`plan`、`ingress_for`、`send*` 系列、`keep_alive_targets` |
 | `strategy.rs` | 各发送模式的编排（harmonic / fallback / jito / tip-only × tip / cost） |
 | `fire.rs` | 单平台 fire-and-forget：build → 取 sig → `tokio::spawn` 发送 |
 | `region_plan.rs` | `RegionPlan`（TOML）、`geo_to_region`、`RegionProfile::ingress_for` |
@@ -46,11 +46,12 @@ sol-tx-dispacher ──► sol-tx-send      平台客户端（endpoint / 保活 
 ```text
 send_v1(ixs, ctx, target_slot, SpendConfig, timeout)
   │
-  ├─ resolve_route(slot)      ──► SendRoute（Harmonic / Jito / P2pTurbo / TipOnly / Fallback）
-  ├─ is_fifo_leader(slot)     ──► 命中则 tip=None、cu_price=None（不参与竞价）
-  ├─ ingress_for(slot)        ──► Region（leader 地区 ∈ fanout ? 该地区 : own）
+  ├─ plan(slot)               ──► SendPlan（**唯一一次**读 oracle 内存缓存）
+  │    ├─ route               ──► Harmonic / Jito / P2pTurbo / TipOnly / Fallback
+  │    ├─ fifo                ──► 命中则 tip=None、gas=None（不参与竞价）
+  │    └─ leader_region → ingress（leader 地区 ∈ fanout ? 该地区 : own）
   │
-  └─ with_region(ingress, dispatch(...))
+  └─ with_region(plan.ingress, dispatch(route = plan.route, ...))
         │
         ├─ harmonic_mode / fallback_mode / jito_mode / tip_only_auto
         │     └─ fire_client(&pool, ...)   ← 每个平台一次
@@ -65,7 +66,9 @@ send_v1(ixs, ctx, target_slot, SpendConfig, timeout)
 
 ## 4. 路由决策
 
-`resolve_route(slot)` 的**顺序**（先命中先返回）：
+`plan(slot)` 只调用一次 `oracle.leader_at()`，route、FIFO、leader_region、ingress 全部从**同一条** `LeaderInfo` 派生，避免同一 slot 多次读缓存或读到两次刷新之间的不同快照。
+
+路由顺序（先命中先返回）：
 
 1. **tip-only 白名单**：`TIP_ONLY_LEADERS`（按 vote account）→ `SendRoute::TipOnly`
 2. **P2P.org Turbo**：`name == "P2P.org Turbo"` → `SendRoute::P2pTurbo`（Fallback + Syncro）
@@ -75,13 +78,20 @@ send_v1(ixs, ctx, target_slot, SpendConfig, timeout)
 
 **FIFO leader**（`fifo.rs`）与 route 正交：命中时强制 `tip=None`（下游折成平台最低）+ `cu_price=None`，因为这类 leader 先到先得、不看竞价。
 
-**入口地区**（`ingress_for`）：
+**入口地区**（`plan.ingress`）：
 
 | 情况 | 入口地区 |
 |---|---|
 | leader 地区 ∈ `fanout` | 该地区（就近网关） |
 | leader 在别洲 / 不在 fanout | `own_region` |
 | DB 无地区 / `geo_to_region` 识别不出 | `own_region` |
+
+### 4.1 数据来源：DB → 内存缓存 → 发送
+
+- `SlotLeaderCache::new()` 在启动时执行一次 `refresh_once()`：RPC 取当前 slot，DB 拉 `[current_slot, max_db_slot]` 写入内存 `DashMap`。
+- `spawn_refresh_task()` 每 10 分钟重复一次；失败只 warn，旧缓存继续可用。
+- `leader_at(slot)` **只读 DashMap**（同步、无 I/O），发送路径不会查 DB / RPC。
+- `plan(slot)` 是发送路径唯一读 `leader_at` 的地方；`resolve_route` / `ingress_for` 是独立查询入口，内部也只读一次缓存。需要同时拿 route 和 ingress 时请直接用 `plan`。
 
 ## 5. 发送模式与 tip 语义
 
