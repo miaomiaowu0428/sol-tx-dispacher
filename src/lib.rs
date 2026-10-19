@@ -22,6 +22,7 @@
 //! ```
 
 mod builder;
+mod config;
 mod bundle;
 mod context;
 mod fifo;
@@ -675,81 +676,113 @@ impl<O: SlotOracle> TxDispacher<O> {
         MultiBundleSenderV1::new(senders)
     }
 
-    /// 已注册 HTTP 平台的保活目标：**只包含真正注入的客户端**。
+    /// 已注册 HTTP 平台的保活目标：**只包含真正注入的客户端，且覆盖池里每个地区**。
     ///
     /// 为什么放在 dispatcher 而不是 `sol-tx-send::endpoint_keep_alive()`：
     /// 后者会把**所有**平台的 endpoint 都探一遍，不管本进程有没有注册那些通道
     /// （客户端初始化失败 / 没配 key 时是 `None`）。既然交易的发送路由就在这个
     /// dispatcher 里，保活也只该覆盖它实际会用的通道。
     ///
-    /// - endpoint 用各平台的 `get_endpoint()`（由全局 `REGION` 决定）；
+    /// - endpoint 逐地区取自各平台的 `endpoint_for(region)`（多地区池 → 多条目标）；
+    /// - 退化到同一 URL 的目标按 URL 去重（平台在那一带没机房时很常见）；
     /// - gRPC（Harmonic）与 QUIC（AstralaneQuic / EverStakeQuic）不在列：
     ///   它们在连接层各自保活（见对应客户端）。
-    /// - 若将来把 LandX 注入 dispatcher，记得在这里补一条（LandX 有官方 `/ping`）。
     pub fn keep_alive_targets(&self) -> Vec<KeepAliveTarget> {
         let mut targets: Vec<KeepAliveTarget> = Vec::new();
 
+        // 每个平台按池里**实际注册的地区**逐个探测。多地区部署时只保 own 的连接，
+        // 其它入口在轮到该 leader 时才首次建连（HTTP 握手 + TLS ≈ 好几个 RTT），
+        // 正好落在最不能慢的那 400ms 里。
         #[cfg(feature = "astralane")]
-        if self.astralane.is_some() {
-            targets.push(KeepAliveTarget::new("Astralane", Astralane::get_endpoint()));
+        if let Some(pool) = &self.astralane {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Astralane", Astralane::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "blockrazor")]
-        if self.blockrazor.is_some() {
-            targets.push(KeepAliveTarget::new("Blockrazor", Blockrazor::get_endpoint()));
+        if let Some(pool) = &self.blockrazor {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Blockrazor", Blockrazor::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "everstake")]
-        if self.everstake.is_some() {
-            targets.push(KeepAliveTarget::new("EverStake", EverStake::get_endpoint()));
+        if let Some(pool) = &self.everstake {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("EverStake", EverStake::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "flash_block")]
-        if self.flash_block.is_some() {
-            targets.push(KeepAliveTarget::new("FlashBlock", FlashBlock::get_endpoint()));
+        if let Some(pool) = &self.flash_block {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("FlashBlock", FlashBlock::endpoint_for(r).to_string()));
+            }
         }
-        #[cfg(feature = "helius")]
-        if self.helius_max.is_some() {
-            targets.push(KeepAliveTarget::new("HeliusMax", HeliusMax::get_endpoint()));
+        #[cfg(feature = "helius_max")]
+        if let Some(pool) = &self.helius_max {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("HeliusMax", HeliusMax::endpoint_for(r).to_string()));
+            }
         }
-        #[cfg(feature = "helius")]
-        if self.helius_swqos.is_some() {
-            targets.push(KeepAliveTarget::new("HeliusSwqos", HeliusSwqos::get_endpoint()));
+        #[cfg(feature = "helius_swqos")]
+        if let Some(pool) = &self.helius_swqos {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("HeliusSwqos", HeliusSwqos::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "jito")]
-        if self.jito.is_some() {
-            targets.push(KeepAliveTarget::new("Jito", Jito::get_endpoint()));
+        if let Some(pool) = &self.jito {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Jito", Jito::endpoint_for(r).to_string()));
+            }
         }
-        // LandX 有官方健康检查：GET http://<host>/ping -> "ok"
         #[cfg(feature = "landx")]
-        if self.landx.is_some() {
-            targets.push(KeepAliveTarget::new("LandX", LandX::get_ping_endpoint()));
+        if let Some(pool) = &self.landx {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("LandX", format!("{}/ping", LandX::endpoint_for_region(r))));
+            }
         }
         #[cfg(feature = "nodeone")]
-        if self.nodeone.is_some() {
-            targets.push(KeepAliveTarget::new("NodeOne", NodeOne::get_endpoint()));
+        if let Some(pool) = &self.nodeone {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("NodeOne", NodeOne::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "temporal")]
-        if self.temporal.is_some() {
-            targets.push(KeepAliveTarget::new("Temporal", Temporal::get_endpoint()));
+        if let Some(pool) = &self.temporal {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Temporal", Temporal::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "zeroslot")]
-        if self.zeroslot.is_some() {
-            targets.push(KeepAliveTarget::new("ZeroSlot", ZeroSlot::get_endpoint()));
+        if let Some(pool) = &self.zeroslot {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("ZeroSlot", ZeroSlot::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "nextblock")]
-        if self.nextblock.is_some() {
-            targets.push(KeepAliveTarget::new("NextBlock", NextBlock::get_endpoint()));
+        if let Some(pool) = &self.nextblock {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("NextBlock", NextBlock::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "stellium")]
-        if self.stellium.is_some() {
-            targets.push(KeepAliveTarget::new("Stellium", Stellium::get_endpoint()));
+        if let Some(pool) = &self.stellium {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Stellium", Stellium::endpoint_for(r).to_string()));
+            }
         }
         #[cfg(feature = "syncro")]
-        if self.syncro.is_some() {
-            targets.push(KeepAliveTarget::new("Syncro", Syncro::get_endpoint()));
+        if let Some(pool) = &self.syncro {
+            for r in pool.regions() {
+                targets.push(KeepAliveTarget::new("Syncro", Syncro::regional_base(r).to_string()));
+            }
         }
 
-        // 未知区域的平台会返回空 endpoint（如 Temporal / ZeroSlot），过滤掉，
-        // 否则会对着空字符串发请求。
+        // 不同目标地区可能退化到同一个 endpoint（该平台在那一带没有机房），
+        // 按 URL 去重，避免同一个 origin 被重复 ping。
         targets.retain(|t| !t.url.trim().is_empty());
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert(t.url.clone()));
         targets
     }
 
@@ -1174,6 +1207,50 @@ mod tests {
         // 没注入的平台不该出现（这里只断言一个代表性平台）
         #[cfg(feature = "jito")]
         assert!(!targets.iter().any(|t| t.name == "Jito"));
+    }
+
+    /// 多地区池：保活必须覆盖**所有**已注册地区，而不只是 own。
+    #[cfg(feature = "astralane")]
+    #[test]
+    fn keep_alive_covers_every_pooled_region() {
+        use sol_tx_send::platform_clients::astralane::Astralane;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam, Region::London],
+        };
+        let d = TxDispacher::builder(NoopOracle)
+            .astralane_pool(RegionPool::build(&profile, |r| Astralane::init_with("k", r)))
+            .build();
+
+        let targets = d.keep_alive_targets();
+        assert_eq!(targets.len(), 3, "三个地区三个 URL: {targets:?}");
+        for needle in ["fr.gateway", "ams.gateway", "lon.gateway"] {
+            assert!(
+                targets.iter().any(|t| t.url.contains(needle)),
+                "缺少 {needle}: {targets:?}"
+            );
+        }
+    }
+
+    /// 退化到同一 endpoint 的目标地区必须去重，否则同一个 origin 被 ping 多次。
+    #[cfg(feature = "temporal")]
+    #[test]
+    fn keep_alive_dedups_degraded_regions() {
+        use sol_tx_send::platform_clients::temporal::Temporal;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Limburg, Region::Lithuania],
+        };
+        let d = TxDispacher::builder(NoopOracle)
+            .temporal_pool(RegionPool::build(&profile, |r| Temporal::init_with("k", r)))
+            .build();
+
+        let targets = d.keep_alive_targets();
+        // Temporal 没有 Limburg / Lithuania 机房，两者都退化到 Amsterdam
+        let temporal: Vec<_> = targets.iter().filter(|t| t.name == "Temporal").collect();
+        assert_eq!(temporal.len(), 2, "应为 FRA + AMS 两条: {targets:?}");
     }
 
     /// LandX 注入后：出现在保活列表，且用官方 `/ping` 健康检查。
