@@ -163,7 +163,10 @@ tokio::spawn(async move { with_region(r, pool.send_tx(&tx)).await });
 
 ### 6.5 保活
 
-`keep_alive_targets()` 遍历**池里每个地区**，取 `endpoint_for(region)`，再按 URL 去重。默认 20s 一轮、首轮错峰、`MissedTickBehavior::Delay`。
+`keep_alive_targets()` 遍历**池里每个地区**，取该平台的保活 URL，再按 URL 去重。默认 20s 一轮、首轮错峰、`MissedTickBehavior::Delay`。
+
+- 大多数平台直接用 `endpoint_for(region)`；
+- **LandX / Helius 用官方 `GET <origin>/ping`**（Helius 不能用提交端点 `.../fast` 探测；Max 与 SWQOS 共用 origin，去重后每个地区只探一次）。
 
 必须比 `HTTP_CLIENT` 的 `pool_idle_timeout`（90s）短，否则连接刚被淘汰又重建。
 
@@ -183,7 +186,7 @@ tokio::spawn(async move { with_region(r, pool.send_tx(&tx)).await });
 | ZeroSlot | ✅ | HTTP | 无 London（回退 AMS） |
 | NextBlock / Stellium | ✅ | HTTP | 有 SLC |
 | Jito | ✅ | HTTP | bundle，只发 tip 笔 |
-| HeliusMax / HeliusSwqos | ✅ | HTTP | 同一 key |
+| HeliusMax / HeliusSwqos | ✅ | HTTP | 同一 key；保活用官方 `/ping` |
 | LandX | ✅ | HTTP | 官方 `/ping` 做保活 |
 | Syncro | ✅ | HTTP | 仅 `P2pTurbo` 路由；无 key 不注册 |
 | EverStake / EverStakeQuic | ✅ / ❌ | HTTP / QUIC | 无需 key |

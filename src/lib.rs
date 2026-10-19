@@ -720,16 +720,19 @@ impl<O: SlotOracle> TxDispacher<O> {
                 targets.push(KeepAliveTarget::new("FlashBlock", FlashBlock::endpoint_for(r).to_string()));
             }
         }
-        #[cfg(feature = "helius_max")]
+        // Helius Max / SWQOS 共用同一组区域 origin。官方保活端点是
+        // `GET <origin>/ping`，**不是**提交端点 `.../fast`；两者按 URL 去重后
+        // 每个地区只会剩下一条探测。
+        #[cfg(feature = "helius")]
         if let Some(pool) = &self.helius_max {
             for r in pool.regions() {
-                targets.push(KeepAliveTarget::new("HeliusMax", HeliusMax::endpoint_for(r).to_string()));
+                targets.push(KeepAliveTarget::new("Helius", HeliusMax::ping_endpoint_for(r)));
             }
         }
-        #[cfg(feature = "helius_swqos")]
+        #[cfg(feature = "helius")]
         if let Some(pool) = &self.helius_swqos {
             for r in pool.regions() {
-                targets.push(KeepAliveTarget::new("HeliusSwqos", HeliusSwqos::endpoint_for(r).to_string()));
+                targets.push(KeepAliveTarget::new("Helius", HeliusSwqos::ping_endpoint_for(r)));
             }
         }
         #[cfg(feature = "jito")]
@@ -1342,6 +1345,53 @@ mod tests {
             targets.iter().any(|t| t.name == "LandX" && t.url.ends_with("/ping")),
             "LandX 保活应走 /ping，实际: {targets:?}"
         );
+    }
+
+    /// Helius 注入后必须进入保活列表，且探测官方 `GET <origin>/ping`，
+    /// 不能拿提交端点 `.../fast` 去探。
+    #[cfg(feature = "helius")]
+    #[test]
+    fn injected_helius_uses_official_ping_endpoint() {
+        use sol_tx_send::platform_clients::helius_max::HeliusMax;
+
+        let d = TxDispacher::builder(NoopOracle)
+            .helius_max(HeliusMax::init_with("test-key", Region::Frankfurt))
+            .build();
+        let targets = d.keep_alive_targets();
+        let helius: Vec<_> = targets.iter().filter(|t| t.name == "Helius").collect();
+        assert_eq!(helius.len(), 1, "应只有一条 FRA 探测: {targets:?}");
+        assert_eq!(helius[0].url, "http://fra-sender.helius-rpc.com/ping");
+    }
+
+    /// Max 与 SWQOS 共用 origin：同一地区只保留一条 `/ping` 探测；
+    /// 不同地区仍各有一条。
+    #[cfg(feature = "helius")]
+    #[test]
+    fn helius_max_and_swqos_share_one_ping_per_region() {
+        use sol_tx_send::platform_clients::helius_max::HeliusMax;
+        use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(NoopOracle)
+            .region_profile(profile.clone())
+            .helius_max_pool(RegionPool::build(&profile, |r| HeliusMax::init_with("k", r)))
+            .helius_swqos_pool(RegionPool::build(&profile, |r| HeliusSwqos::init_with("k", r)))
+            .build();
+
+        let helius: Vec<_> = d
+            .keep_alive_targets()
+            .into_iter()
+            .filter(|t| t.name == "Helius")
+            .collect();
+        assert_eq!(helius.len(), 2, "FRA + AMS 各一条: {helius:?}");
+        for t in &helius {
+            assert!(t.url.ends_with("/ping"), "{t:?}");
+            assert!(!t.url.contains("/fast"), "{t:?}");
+            assert!(!t.url.contains("swqos_only"), "{t:?}");
+        }
     }
 
     #[test]
