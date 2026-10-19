@@ -73,6 +73,7 @@ solana-sdk = "4.0.0"
 solana-client = "4.2.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+async-trait = "0.1"
 
 [dev-dependencies]
 const-accounts = { git = "https://github.com/miaomiaowu0428/const-accounts.git", branch = "main" }

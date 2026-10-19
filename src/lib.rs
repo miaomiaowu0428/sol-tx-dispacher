@@ -27,12 +27,14 @@ mod context;
 mod fifo;
 mod fire;
 mod region_plan;
+mod region_pool;
 mod strategy;
 
 pub use builder::TxDispacherBuilder;
 pub use region_plan::{
     DEFAULT_PLAN, PLAN_PATH_ENV, Policy, RegionPlan, RegionProfile, SUPPORTED_VERSION,
 };
+pub use region_pool::{RegionPool, SEND_REGION, with_region};
 pub use bundle::{MultiBundleError, MultiBundleErrorV1, MultiBundleSender, MultiBundleSenderV1};
 pub use context::{SendContext, merge_alts};
 
@@ -571,37 +573,37 @@ pub struct TxDispacher<O: SlotOracle> {
     oracle: O,
 
     #[cfg(feature = "astralane")]
-    pub(crate) astralane: Option<Arc<Astralane>>,
+    pub(crate) astralane: Option<Arc<RegionPool<Astralane>>>,
     #[cfg(feature = "astralane_quic")]
     pub(crate) astralane_quic: Option<Arc<AstralaneQuic>>,
     #[cfg(feature = "everstake")]
-    pub(crate) everstake: Option<Arc<EverStake>>,
+    pub(crate) everstake: Option<Arc<RegionPool<EverStake>>>,
     #[cfg(feature = "everstake_quic")]
     pub(crate) everstake_quic: Option<Arc<EverStakeQuic>>,
     #[cfg(feature = "flash_block")]
-    pub(crate) flash_block: Option<Arc<FlashBlock>>,
+    pub(crate) flash_block: Option<Arc<RegionPool<FlashBlock>>>,
     #[cfg(feature = "nodeone")]
-    pub(crate) nodeone: Option<Arc<NodeOne>>,
+    pub(crate) nodeone: Option<Arc<RegionPool<NodeOne>>>,
     #[cfg(feature = "blockrazor")]
-    pub(crate) blockrazor: Option<Arc<Blockrazor>>,
+    pub(crate) blockrazor: Option<Arc<RegionPool<Blockrazor>>>,
     #[cfg(feature = "temporal")]
-    pub(crate) temporal: Option<Arc<Temporal>>,
+    pub(crate) temporal: Option<Arc<RegionPool<Temporal>>>,
     #[cfg(feature = "helius")]
-    pub(crate) helius_max: Option<Arc<HeliusMax>>,
+    pub(crate) helius_max: Option<Arc<RegionPool<HeliusMax>>>,
     #[cfg(feature = "helius")]
-    pub(crate) helius_swqos: Option<Arc<HeliusSwqos>>,
+    pub(crate) helius_swqos: Option<Arc<RegionPool<HeliusSwqos>>>,
     #[cfg(feature = "zeroslot")]
-    pub(crate) zeroslot: Option<Arc<ZeroSlot>>,
+    pub(crate) zeroslot: Option<Arc<RegionPool<ZeroSlot>>>,
     #[cfg(feature = "nextblock")]
-    pub(crate) nextblock: Option<Arc<NextBlock>>,
+    pub(crate) nextblock: Option<Arc<RegionPool<NextBlock>>>,
     #[cfg(feature = "stellium")]
-    pub(crate) stellium: Option<Arc<Stellium>>,
+    pub(crate) stellium: Option<Arc<RegionPool<Stellium>>>,
     #[cfg(feature = "syncro")]
-    pub(crate) syncro: Option<Arc<Syncro>>,
+    pub(crate) syncro: Option<Arc<RegionPool<Syncro>>>,
     #[cfg(feature = "jito")]
-    pub(crate) jito: Option<Arc<Jito>>,
+    pub(crate) jito: Option<Arc<RegionPool<Jito>>>,
     #[cfg(feature = "landx")]
-    pub(crate) landx: Option<Arc<LandX>>,
+    pub(crate) landx: Option<Arc<RegionPool<LandX>>>,
     #[cfg(feature = "harmonic")]
     pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
