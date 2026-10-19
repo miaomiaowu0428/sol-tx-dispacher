@@ -78,6 +78,18 @@ fn default_true() -> bool {
     true
 }
 
+impl Default for RegionPlan {
+    /// 空计划：没有任何 profile。`profile_or_single` 会把本机地区当成单地区
+    /// profile，因此这是「配置加载失败」时的安全兜底。
+    fn default() -> Self {
+        Self {
+            version: SUPPORTED_VERSION,
+            profiles: Vec::new(),
+            policy: Policy::default(),
+        }
+    }
+}
+
 impl RegionPlan {
     /// 从 TOML 文本解析并校验。
     pub fn parse(src: &str) -> Result<Self> {
