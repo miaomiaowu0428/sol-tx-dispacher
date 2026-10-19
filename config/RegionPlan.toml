@@ -1,0 +1,49 @@
+# ── 地区路由计划 ─────────────────────────────────────────────────────────────
+#
+# 只配置「附近」的入口地区，不跨洲。启动时按本机 REGION 选 profile。
+#
+#   fanout : 本机要开哪些入口地区，**顺序即优先级**（近 -> 远）；必须含 own_region
+#
+# 每个地区实际开哪些平台 = fanout ∩ 平台自身能力。
+# 「这个平台在这个地区有没有」由各平台代码里的 endpoint_for(region) 穷举决定
+# （缺机房时自动就近回退，Unknown 统一回退 Frankfurt），不要在配置里再写平台名。
+#
+# 加载方式：本文件在编译期通过 include_str! 内嵌进二进制，改完要重新编译；
+# 线上临时调整可设 REGION_PLAN_PATH=/path/to/RegionPlan.toml 运行时覆盖。
+#
+# 校验规则（违反会直接启动失败，避免静默跑错地区）：
+#   - version 必须等于 1
+#   - own_region 不能是 Unknown，且不能重复
+#   - fanout 非空、不含 Unknown、不含重复项、必须包含 own_region
+#   - 地区名写错（如 "Mars"）会反序列化失败，不会静默变 Unknown
+
+version = 1
+
+# ── 欧洲 ────────────────────────────────────────────────────────────────────
+[[profiles]]
+own_region = "Frankfurt"
+fanout = ["Frankfurt", "Amsterdam", "Limburg", "Lithuania"]
+
+[[profiles]]
+own_region = "Amsterdam"
+fanout = ["Amsterdam", "Frankfurt", "Limburg", "Lithuania"]
+
+[[profiles]]
+own_region = "London"
+fanout = ["London", "Amsterdam", "Frankfurt"]
+
+# ── 北美 ────────────────────────────────────────────────────────────────────
+[[profiles]]
+own_region = "NewYork"
+fanout = ["NewYork", "SaltLakeCity"]
+
+# ── 亚太 ────────────────────────────────────────────────────────────────────
+[[profiles]]
+own_region = "Tokyo"
+fanout = ["Tokyo", "Singapore"]
+
+# ── 路由策略 ────────────────────────────────────────────────────────────────
+[policy]
+# leader 地区在 fanout 内 -> 走该地区入口；
+# 不在（跨洲的 leader） -> 回退 own_region，由平台自己内部路由。
+leader_local = true

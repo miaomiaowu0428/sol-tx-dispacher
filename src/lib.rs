@@ -26,9 +26,13 @@ mod bundle;
 mod context;
 mod fifo;
 mod fire;
+mod region_plan;
 mod strategy;
 
 pub use builder::TxDispacherBuilder;
+pub use region_plan::{
+    DEFAULT_PLAN, PLAN_PATH_ENV, Policy, RegionPlan, RegionProfile, SUPPORTED_VERSION,
+};
 pub use bundle::{MultiBundleError, MultiBundleErrorV1, MultiBundleSender, MultiBundleSenderV1};
 pub use context::{SendContext, merge_alts};
 
