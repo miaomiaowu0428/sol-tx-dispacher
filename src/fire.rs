@@ -57,9 +57,16 @@ pub fn fire_client<C>(
 
     let sender = Arc::clone(client);
     let platform = client.to_string();
+    // 把当前任务的目标入口地区**显式带进 spawn 出来的 task**：task-local 不会跨
+    // `tokio::spawn` 继承，不重新 scope 的话 RegionPool 只会看到 None 并退回 own。
+    let region = crate::region_pool::current_region();
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
-        if let Err(e) = sender.send_tx(&tx).await {
+        let res = match region {
+            Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
+            None => sender.send_tx(&tx).await,
+        };
+        if let Err(e) = res {
             log::error!("[fire] {} send failed: {}", sender, e);
         }
         // ③ 单条 log：构建耗时 + 发送耗时（发送为交给平台、不等链上确认），按 sig 可查
@@ -118,9 +125,14 @@ pub fn fire_v1_client<C>(
 
     let sender = Arc::clone(client);
     let platform = client.to_string();
+    let region = crate::region_pool::current_region();
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
-        if let Err(e) = sender.send_tx(&tx).await {
+        let res = match region {
+            Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
+            None => sender.send_tx(&tx).await,
+        };
+        if let Err(e) = res {
             log::error!("[fire-v1] {} send failed: {}", sender, e);
         }
         log::info!(

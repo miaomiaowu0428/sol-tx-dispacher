@@ -172,9 +172,118 @@ impl RegionProfile {
     }
 }
 
+/// 把 `slot_leader.region` 的原始文本映射到发送侧的地区枚举。
+///
+/// DB 里的格式是 `"<国家> / <城市>"`（例如 `"Germany / Frankfurt am Main"`），
+/// 城市数量远多于我们关心的机房，所以按「城市关键词 → 国家」两级匹配：
+///
+/// 1. 先认城市（同一国家里可能有多個我们关心的地区，比如美国的东西部）；
+/// 2. 认不出城市时按国家归类（德国→法兰克福、荷兰→阿姆斯特丹…）；
+/// 3. 都不命中返回 [`Region::Unknown`]，由调用方回退 `own_region`。
+///
+/// 刻意保守：宁可返回 `Unknown`（不参与 leader 就近路由），也不要把欧洲的
+/// leader 猜成大西洋对岸。
+pub fn geo_to_region(geo: &str) -> Region {
+    let s = geo.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Region::Unknown;
+    }
+
+    // ── 城市级（同国家内需要区分地区）──────────────────────────────────
+    // 欧洲
+    if s.contains("amsterdam") || s.contains("haarlem") || s.contains("schiphol") {
+        return Region::Amsterdam;
+    }
+    if s.contains("frankfurt") || s.contains("eschborn") || s.contains("offenbach") || s.contains("hanau") {
+        return Region::Frankfurt;
+    }
+    if s.contains("london") || s.contains("bexley") || s.contains("kent") {
+        return Region::London;
+    }
+    if s.contains("dublin") || s.contains("crumlin") {
+        return Region::Dublin;
+    }
+    if s.contains("limburg") {
+        return Region::Limburg;
+    }
+    if s.contains("lithuania") || s.contains("šiauliai") || s.contains("siauliai") {
+        return Region::Lithuania;
+    }
+    // 亚太
+    if s.contains("tokyo") {
+        return Region::Tokyo;
+    }
+    if s.contains("singapore") {
+        return Region::Singapore;
+    }
+    // 北美
+    if s.contains("newark") || s.contains("new york") || s.contains("sterling") || s.contains("leesburg") || s.contains("boardman") || s.contains("secaucus") {
+        return Region::NewYork;
+    }
+    if s.contains("salt lake") || s.contains("bluffdale") {
+        return Region::SaltLakeCity;
+    }
+    if s.contains("los angeles") || s.contains("san jose") || s.contains("corona") || s.contains("fremont") {
+        return Region::LosAngeles;
+    }
+    if s.contains("pittsburgh") {
+        return Region::Pittsburgh;
+    }
+
+    // ── 国家级（城市不认识，但国家能定位到大区）────────────────────────
+    let country = s.split('/').next().unwrap_or("").trim().to_string();
+    match country.as_str() {
+        "germany" => Region::Frankfurt,
+        "the netherlands" | "netherlands" => Region::Amsterdam,
+        "united kingdom" => Region::London,
+        "ireland" => Region::Dublin,
+        "lithuania" => Region::Lithuania,
+        "japan" => Region::Tokyo,
+        "singapore" => Region::Singapore,
+        // 美国/加拿大/南美跨度太大，城市认不出就不猜
+        _ => Region::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_maps_major_cities() {
+        use Region::*;
+        let cases = [
+            ("Germany / Frankfurt am Main", Frankfurt),
+            ("The Netherlands / Amsterdam", Amsterdam),
+            ("United Kingdom / London", London),
+            ("Ireland / Crumlin", Dublin),
+            ("Lithuania / Šiauliai", Lithuania),
+            ("Japan / Tokyo", Tokyo),
+            ("Singapore / Singapore", Singapore),
+            ("United States / Newark", NewYork),
+            ("United States / Bluffdale", SaltLakeCity),
+            ("United States / San Jose", LosAngeles),
+            ("United States / Pittsburgh", Pittsburgh),
+        ];
+        for (geo, expected) in cases {
+            assert_eq!(super::geo_to_region(geo), expected, "geo={geo}");
+        }
+    }
+
+    #[test]
+    fn geo_falls_back_to_country_then_unknown() {
+        use Region::*;
+        // 城市不认识，但国家能定性
+        assert_eq!(super::geo_to_region("Germany / Eschborn"), Frankfurt);
+        assert_eq!(super::geo_to_region("The Netherlands / Lelystad"), Amsterdam);
+        assert_eq!(super::geo_to_region("Japan / Monzen-nakachō"), Tokyo);
+        // 美国城市不认识时不猜（跨度太大）
+        assert_eq!(super::geo_to_region("United States / Nowhere"), Unknown);
+        assert_eq!(super::geo_to_region("Brazil / São Paulo"), Unknown);
+        // 空值 / 脏数据
+        assert_eq!(super::geo_to_region(""), Unknown);
+        assert_eq!(super::geo_to_region("   "), Unknown);
+    }
 
     #[test]
     fn default_plan_is_valid() {

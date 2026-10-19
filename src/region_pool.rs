@@ -41,6 +41,11 @@ tokio::task_local! {
     pub static SEND_REGION: Region;
 }
 
+/// 当前任务的目标入口地区（没有设置 hint 时返回 `None`）。
+pub fn current_region() -> Option<Region> {
+    SEND_REGION.try_with(|r| *r).ok()
+}
+
 /// 在 `region` 的 hint 下执行 `fut`。
 pub async fn with_region<F: std::future::Future>(region: Region, fut: F) -> F::Output {
     SEND_REGION.scope(region, fut).await

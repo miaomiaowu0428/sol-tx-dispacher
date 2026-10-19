@@ -43,6 +43,7 @@ use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
 use sol_slot_leader::SlotOracle;
 use sol_tx_send::platform_clients::{BundleSender, KeepAliveTarget, V1TxConfig, run_keep_alive};
+use sol_tx_send::platform_clients::Region;
 use std::sync::Arc;
 
 /// 走 tip-only 模式的 leader vote account（只靠 tip 竞价，不参与 cu_price 竞争）
@@ -572,6 +573,8 @@ pub enum SendRoute {
 /// 通过 [`TxDispacherBuilder`] 构造，各平台客户端按 feature 开关。
 pub struct TxDispacher<O: SlotOracle> {
     oracle: O,
+    /// 本机地区计划：leader 地区 -> 用哪个入口地区的 client。
+    region_profile: RegionProfile,
 
     #[cfg(feature = "astralane")]
     pub(crate) astralane: Option<Arc<RegionPool<Astralane>>>,
@@ -814,6 +817,21 @@ impl<O: SlotOracle> TxDispacher<O> {
         sigs.into_iter().next()
     }
 
+    /// 本次发送应使用哪个入口地区的 client。
+    ///
+    /// `leader 地区 ∈ fanout` → 用该地区（就近）；否则回退 `own_region`
+    /// （跨洲 leader 由平台内部路由）。
+    pub fn ingress_for(&self, slot: u64) -> Region {
+        let leader_region = self
+            .oracle
+            .leader_at(slot)
+            .and_then(|info| info.region)
+            .as_deref()
+            .map(region_plan::geo_to_region)
+            .unwrap_or(Region::Unknown);
+        self.region_profile.ingress_for(leader_region)
+    }
+
     /// 查询当前 slot 的路由决策（不发送）。
     /// 查询 `target_slot` 的 leader 类型并返回路由决策。
     /// 调用方自行决定传当前 slot 还是 current_slot + N。
@@ -883,12 +901,12 @@ impl<O: SlotOracle> TxDispacher<O> {
                 target_slot,
                 route
             );
-            return strategy::dispatch(self, ixs, ctx, route, None, (cu.0, None), confirm_timeout_secs)
+            return crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch(self, ixs, ctx, route, None, (cu.0, None), confirm_timeout_secs))
                 .await
                 .map_err(into_tx_confirm_err);
         }
         log::info!("[TxDispacher] slot={} route={:?}", target_slot, route);
-        strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs)
+        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch(self, ixs, ctx, route, tip_strategy, cu, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -905,7 +923,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu: (Option<u32>, Option<u64>),
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs)
+        crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -931,7 +949,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             route,
             min_tip_floor
         );
-        strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs)
+        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_tip_only(self, ixs, ctx, route, min_tip_floor, cu_limit, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -964,14 +982,17 @@ impl<O: SlotOracle> TxDispacher<O> {
                 target_slot,
                 route
             );
-            return strategy::dispatch(
-                self,
-                ixs,
-                ctx,
-                route,
-                None,
-                (Some(config.cu_limit), None),
-                confirm_timeout_secs,
+            return crate::region_pool::with_region(
+                self.ingress_for(target_slot),
+                strategy::dispatch(
+                    self,
+                    ixs,
+                    ctx,
+                    route,
+                    None,
+                    (Some(config.cu_limit), None),
+                    confirm_timeout_secs,
+                ),
             )
             .await
             .map_err(into_tx_confirm_err);
@@ -984,7 +1005,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             config.cu_limit,
             config.tip_rate
         );
-        strategy::dispatch_with_cost(self, ixs, ctx, route, config, confirm_timeout_secs)
+        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_with_cost(self, ixs, ctx, route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1009,7 +1030,7 @@ impl<O: SlotOracle> TxDispacher<O> {
         config: V1TxConfig,
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
-        strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs)
+        crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1052,15 +1073,18 @@ impl<O: SlotOracle> TxDispacher<O> {
                         target_slot
                     );
                 }
-                strategy::dispatch_v1(
-                    self,
-                    ixs,
-                    ctx,
-                    route,
-                    tip_strategy,
-                    cfg.as_tip_config(),
-                    if is_fifo { None } else { tip_leg_gas },
-                    confirm_timeout_secs,
+                crate::region_pool::with_region(
+                    self.ingress_for(target_slot),
+                    strategy::dispatch_v1(
+                        self,
+                        ixs,
+                        ctx,
+                        route,
+                        tip_strategy,
+                        cfg.as_tip_config(),
+                        if is_fifo { None } else { tip_leg_gas },
+                        confirm_timeout_secs,
+                    ),
                 )
                 .await
                 .map_err(into_tx_confirm_err)
@@ -1096,20 +1120,23 @@ impl<O: SlotOracle> TxDispacher<O> {
                 target_slot,
                 route
             );
-            return strategy::dispatch_v1(
-                self,
-                ixs,
-                ctx,
-                route,
-                None,
-                // FIFO 下只需 cu_limit，priority_fee 置 None
-                sol_tx_send::platform_clients::V1TxConfig {
-                    priority_fee: None,
-                    compute_unit_limit: Some(config.cu_limit),
-                    ..Default::default()
-                },
-                None, // 保底 gas：FIFO 下不给
-                confirm_timeout_secs,
+            return crate::region_pool::with_region(
+                self.ingress_for(target_slot),
+                strategy::dispatch_v1(
+                    self,
+                    ixs,
+                    ctx,
+                    route,
+                    None,
+                    // FIFO 下只需 cu_limit，priority_fee 置 None
+                    sol_tx_send::platform_clients::V1TxConfig {
+                        priority_fee: None,
+                        compute_unit_limit: Some(config.cu_limit),
+                        ..Default::default()
+                    },
+                    None, // 保底 gas：FIFO 下不给
+                    confirm_timeout_secs,
+                ),
             )
             .await
             .map_err(into_tx_confirm_err);
@@ -1122,7 +1149,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             config.cu_limit,
             config.tip_rate
         );
-        strategy::dispatch_with_cost_v1(self, ixs, ctx, route, config, confirm_timeout_secs)
+        crate::region_pool::with_region(self.ingress_for(target_slot), strategy::dispatch_with_cost_v1(self, ixs, ctx, route, config, confirm_timeout_secs))
             .await
             .map_err(into_tx_confirm_err)
     }
@@ -1156,6 +1183,7 @@ mod tests {
     struct MockOracle {
         harmonic: bool,
         name: Option<&'static str>,
+        region: Option<&'static str>,
     }
 
     impl SlotOracle for MockOracle {
@@ -1169,6 +1197,7 @@ mod tests {
                 name: self.name.map(str::to_string),
                 leader: None,
                 client_type_id: None,
+                region: self.region.map(str::to_string),
             })
         }
     }
@@ -1179,6 +1208,52 @@ mod tests {
     fn noop_oracle_always_fallback() {
         let d = TxDispacher::builder(NoopOracle).build();
         assert_eq!(d.resolve_route(422_000_000), SendRoute::Fallback);
+    }
+
+    // ── leader 地区 -> 入口地区 ────────────────────────────────────────────────
+
+    /// leader 在 fanout 内 -> 用该地区；跨洲 -> 回退本机。
+    #[test]
+    fn ingress_follows_leader_region_within_fanout() {
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(MockOracle {
+            harmonic: false,
+            name: None,
+            region: Some("The Netherlands / Amsterdam"),
+        })
+        .region_profile(profile.clone())
+        .build();
+        assert_eq!(d.ingress_for(1), Region::Amsterdam);
+
+        // 跨洲 leader（东京不在 fanout 里）-> 本机
+        let d = TxDispacher::builder(MockOracle {
+            harmonic: false,
+            name: None,
+            region: Some("Japan / Tokyo"),
+        })
+        .region_profile(profile)
+        .build();
+        assert_eq!(d.ingress_for(1), Region::Frankfurt);
+    }
+
+    /// 没有地区数据 / 无法识别 -> 回退本机，绝不乱猜。
+    #[test]
+    fn ingress_falls_back_to_own_without_region_data() {
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let d = TxDispacher::builder(MockOracle {
+            harmonic: false,
+            name: None,
+            region: None,
+        })
+        .region_profile(profile)
+        .build();
+        assert_eq!(d.ingress_for(1), Region::Frankfurt);
     }
 
     // ── keep-alive 目标收集 ───────────────────────────────────────────────────
@@ -1274,6 +1349,7 @@ mod tests {
         let d = TxDispacher::builder(MockOracle {
             harmonic: true,
             name: None,
+            region: None,
         })
         .build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
@@ -1284,6 +1360,7 @@ mod tests {
         let d = TxDispacher::builder(MockOracle {
             harmonic: false,
             name: None,
+            region: None,
         })
         .build();
         assert_eq!(d.resolve_route(100), SendRoute::Fallback);
@@ -1295,6 +1372,7 @@ mod tests {
         let oracle = MockOracle {
             harmonic: false,           // client_type = Agave
             name: Some("Harmonic-SG"), // name 含 harmonic
+            region: None,
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::Harmonic);
@@ -1305,6 +1383,7 @@ mod tests {
         let oracle = MockOracle {
             harmonic: false,
             name: Some("P2P.org Turbo"),
+            region: None,
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::P2pTurbo);
@@ -1316,6 +1395,7 @@ mod tests {
         let oracle = MockOracle {
             harmonic: true,
             name: Some("P2P.org Turbo"),
+            region: None,
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::P2pTurbo);
@@ -1326,6 +1406,7 @@ mod tests {
         let oracle = MockOracle {
             harmonic: false,
             name: Some("P2P.org"),
+            region: None,
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::Fallback);

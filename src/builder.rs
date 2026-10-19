@@ -1,6 +1,7 @@
 //! TxDispacherBuilder — 逐个注入平台客户端，build() 得到 TxDispacher。
 
 use crate::TxDispacher;
+use crate::RegionProfile;
 use crate::region_pool::RegionPool;
 use sol_tx_send::constants::REGION;
 use sol_slot_leader::SlotOracle;
@@ -44,6 +45,8 @@ use sol_tx_send::platform_clients::zeroslot::ZeroSlot;
 /// TxDispacher 构建器。
 pub struct TxDispacherBuilder<O: SlotOracle> {
     oracle: O,
+    /// 本机的地区计划（决定 leader 地区 -> 入口地区）。
+    region_profile: RegionProfile,
 
     #[cfg(feature = "astralane")]
     astralane: Option<Arc<RegionPool<Astralane>>>,
@@ -85,6 +88,7 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     pub(crate) fn new(oracle: O) -> Self {
         Self {
             oracle,
+            region_profile: RegionProfile::single(*REGION),
             #[cfg(feature = "astralane")]
             astralane: None,
             #[cfg(feature = "astralane_quic")]
@@ -120,6 +124,14 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             #[cfg(feature = "harmonic")]
             harmonic: None,
         }
+    }
+
+    /// 注入地区计划（决定 leader 所在地区 -> 用哪个入口地区的 client）。
+    ///
+    /// 不设置时退化为「只开本机地区」，行为与旧版本一致。
+    pub fn region_profile(mut self, profile: RegionProfile) -> Self {
+        self.region_profile = profile;
+        self
     }
 
     // ── setter 方法（feature-gated）────────────────────────────────────────
@@ -322,6 +334,7 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     pub fn build(self) -> TxDispacher<O> {
         TxDispacher {
             oracle: self.oracle,
+            region_profile: self.region_profile,
             #[cfg(feature = "astralane")]
             astralane: self.astralane,
             #[cfg(feature = "astralane_quic")]

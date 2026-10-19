@@ -57,7 +57,7 @@ impl<O: SlotOracle> TxDispacher<O> {
             profile.fanout
         );
 
-        let mut b = TxDispacher::builder(oracle);
+        let mut b = TxDispacher::builder(oracle).region_profile(profile.clone());
 
         // ── HTTP 平台（参与 fanout）────────────────────────────────────────
         #[cfg(feature = "astralane")]
