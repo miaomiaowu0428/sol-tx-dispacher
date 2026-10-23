@@ -315,6 +315,8 @@ async fn harmonic_mode<O: SlotOracle>(
 
     #[cfg(feature = "landx")]
     fire_no_price!(d.landx, tip: tip_strategy);
+    #[cfg(feature = "landx_udp")]
+    fire_no_price!(d.landx_udp, tip: tip_strategy);
 
     #[cfg(feature = "jito")]
     fire_no_price!(d.jito, tip: tip_strategy);
@@ -578,6 +580,8 @@ async fn fallback_mode<O: SlotOracle>(
 
     #[cfg(feature = "landx")]
     fire_with_price!(d.landx, tip: Some(TipStrategy::Ratio(1.05)));
+    #[cfg(feature = "landx_udp")]
+    fire_with_price!(d.landx_udp, tip: Some(TipStrategy::Ratio(1.05)));
 
     // Jito bundle 靠 tip 排序，cu_price 意义不大 → 只发 no_price 版本
     #[cfg(feature = "jito")]
@@ -763,6 +767,8 @@ async fn fallback_cost_mode<O: SlotOracle>(
     fire_with_price!(d.stellium);
     #[cfg(feature = "landx")]
     fire_with_price!(d.landx);
+    #[cfg(feature = "landx_udp")]
+    fire_with_price!(d.landx_udp);
 
     // Jito bundle 靠 tip 排序 → 只发 no_price（全额 tip）
     #[cfg(feature = "jito")]
@@ -1065,6 +1071,8 @@ async fn fire_all_parallel(
     spawn_fire!(d.stellium);
     #[cfg(feature = "landx")]
     spawn_fire!(d.landx);
+    #[cfg(feature = "landx_udp")]
+    spawn_fire!(d.landx_udp);
 
     // P2P.org Turbo：追加 Syncro 通道（tip-only：tip=max(floor, 平台最低)，带 cu_price）
     #[cfg(feature = "syncro")]
@@ -1434,6 +1442,8 @@ async fn harmonic_mode_v1<O: SlotOracle>(
     fire_v1_no_price!(d.stellium, tip: tip_strategy);
     #[cfg(feature = "landx")]
     fire_v1_no_price!(d.landx, tip: tip_strategy);
+    #[cfg(feature = "landx_udp")]
+    fire_v1_no_price!(d.landx_udp, tip: tip_strategy);
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito, tip: tip_strategy);
 
@@ -1670,6 +1680,8 @@ async fn fallback_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "landx")]
     fire_v1_with_price!(d.landx, tip: with_price_tip);
+    #[cfg(feature = "landx_udp")]
+    fire_v1_with_price!(d.landx_udp, tip: with_price_tip);
 
     #[cfg(feature = "jito")]
     fire_v1_no_price!(d.jito, tip: tip_strategy);
@@ -1887,6 +1899,8 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
     fire_v1_with_price!(d.stellium);
     #[cfg(feature = "landx")]
     fire_v1_with_price!(d.landx);
+    #[cfg(feature = "landx_udp")]
+    fire_v1_with_price!(d.landx_udp);
 
     // Jito bundle 靠 tip 排序 → 只发 no_price（全额 tip）
     #[cfg(feature = "jito")]
@@ -2075,6 +2089,8 @@ async fn fire_all_parallel_v1(
     spawn_fire_v1!(d.stellium);
     #[cfg(feature = "landx")]
     spawn_fire_v1!(d.landx);
+    #[cfg(feature = "landx_udp")]
+    spawn_fire_v1!(d.landx_udp);
 
     // P2P.org Turbo：追加 Syncro 通道
     #[cfg(feature = "syncro")]

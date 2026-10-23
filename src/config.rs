@@ -157,6 +157,16 @@ impl<O: SlotOracle> TxDispacher<O> {
         }
 
         // ── 单地区通道（不参与 fanout）─────────────────────────────────────
+        // LandX UDP：无连接状态、不需要保活/重连，一个 socket 打天下。
+        // 同时解锁 fra2/fra3/slc1/dub1 四个"仅 UDP"机房（HTTP 只能回退到别的机房）。
+        #[cfg(feature = "landx_udp")]
+        if let Some(key) = env_key("LANDX_API_KEY") {
+            match sol_tx_send::platform_clients::landx_udp::LandXUdp::init_with(key, own).await {
+                Ok(c) => b = b.landx_udp(c),
+                Err(e) => log::warn!("[TxDispacher] LandXUdp 初始化失败，跳过: {e}"),
+            }
+        }
+
         // FlashBlock QUIC（FLQ1）：有状态的已认证长连接，只能单地区注册。
         // ⚠️ 与 HTTP 通道共用同一个 key 和**同一个 TPS 限额**，两条同时开会互相抢。
         #[cfg(feature = "flash_block_quic")]

@@ -531,6 +531,8 @@ use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 use sol_tx_send::platform_clients::jito::Jito;
 #[cfg(feature = "landx")]
 use sol_tx_send::platform_clients::landx::LandX;
+#[cfg(feature = "landx_udp")]
+use sol_tx_send::platform_clients::landx_udp::LandXUdp;
 #[cfg(feature = "nextblock")]
 use sol_tx_send::platform_clients::nextblock::NextBlock;
 #[cfg(feature = "nodeone")]
@@ -691,6 +693,8 @@ pub struct TxDispacher<O: SlotOracle> {
     pub(crate) jito: Option<Arc<RegionPool<Jito>>>,
     #[cfg(feature = "landx")]
     pub(crate) landx: Option<Arc<RegionPool<LandX>>>,
+    #[cfg(feature = "landx_udp")]
+    pub(crate) landx_udp: Option<Arc<LandXUdp>>,
     #[cfg(feature = "harmonic")]
     pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
 }

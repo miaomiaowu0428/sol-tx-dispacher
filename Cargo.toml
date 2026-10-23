@@ -20,6 +20,7 @@ default = [
     "stellium",
     "jito",
     "landx",
+    "landx_udp",
     "harmonic",
     "syncro",
 ]
@@ -40,6 +41,7 @@ full = [
     "stellium",
     "jito",
     "landx",
+    "landx_udp",
     "harmonic",
     "syncro",
 ]
@@ -65,6 +67,9 @@ stellium        = []
 jito            = []
 # LandX：HTTP JSON-RPC SWQoS 通道（API key 放在 URL path 里，见 LANDX_API_KEY）
 landx           = []
+# LandX UDP Binary-Tx（UDP <host>:10000，包体 = 12B key + wire tx，无回执）
+# 额外解锁 fra2/fra3/slc1/dub1 四个"仅 UDP"机房。
+landx_udp       = []
 harmonic        = []
 # P2P.org Syncro Sender：P2P.org Turbo 节点出块时追加的 SWQoS 通道（带 API key）
 syncro          = []

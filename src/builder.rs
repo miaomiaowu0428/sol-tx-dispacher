@@ -31,6 +31,8 @@ use sol_tx_send::platform_clients::helius_swqos::HeliusSwqos;
 use sol_tx_send::platform_clients::jito::Jito;
 #[cfg(feature = "landx")]
 use sol_tx_send::platform_clients::landx::LandX;
+#[cfg(feature = "landx_udp")]
+use sol_tx_send::platform_clients::landx_udp::LandXUdp;
 #[cfg(feature = "nextblock")]
 use sol_tx_send::platform_clients::nextblock::NextBlock;
 #[cfg(feature = "nodeone")]
@@ -88,6 +90,8 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     jito: Option<Arc<RegionPool<Jito>>>,
     #[cfg(feature = "landx")]
     landx: Option<Arc<RegionPool<LandX>>>,
+    #[cfg(feature = "landx_udp")]
+    landx_udp: Option<Arc<LandXUdp>>,
     #[cfg(feature = "harmonic")]
     harmonic: Option<Arc<HarmonicBlockEngine>>,
 }
@@ -133,6 +137,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             jito: None,
             #[cfg(feature = "landx")]
             landx: None,
+            #[cfg(feature = "landx_udp")]
+            landx_udp: None,
             #[cfg(feature = "harmonic")]
             harmonic: None,
         }
@@ -255,6 +261,12 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     }
 
     /// 注入 **LandX**（HTTP JSON-RPC，API key 放 URL path）。
+    #[cfg(feature = "landx_udp")]
+    pub fn landx_udp(mut self, c: LandXUdp) -> Self {
+        self.landx_udp = Some(Arc::new(c));
+        self
+    }
+
     #[cfg(feature = "landx")]
     pub fn landx(mut self, c: LandX) -> Self {
         self.landx = Some(Arc::new(RegionPool::single(*REGION, c)));
@@ -395,6 +407,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             jito: self.jito,
             #[cfg(feature = "landx")]
             landx: self.landx,
+            #[cfg(feature = "landx_udp")]
+            landx_udp: self.landx_udp,
             #[cfg(feature = "harmonic")]
             harmonic: self.harmonic,
         }
