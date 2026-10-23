@@ -891,7 +891,12 @@ impl<O: SlotOracle> TxDispacher<O> {
         #[cfg(feature = "astralane")]
         if let Some(pool) = &self.astralane {
             for r in pool.regions() {
-                targets.push(KeepAliveTarget::new("Astralane", Astralane::endpoint_for(r).to_string()));
+                // 扇出（ASTRALANE_FANOUT）打开的额外入口也要保活，否则它们会在
+                // 第一次真正要发交易时现做 DNS + TCP + TLS，正好落在最不能慢的窗口。
+                // 后面按 URL 去重，所以列全量是安全的。
+                for ep in Astralane::endpoints_for(r) {
+                    targets.push(KeepAliveTarget::new("Astralane", ep));
+                }
             }
         }
         #[cfg(feature = "blockrazor")]
@@ -936,13 +941,20 @@ impl<O: SlotOracle> TxDispacher<O> {
         #[cfg(feature = "landx")]
         if let Some(pool) = &self.landx {
             for r in pool.regions() {
-                targets.push(KeepAliveTarget::new("LandX", format!("{}/ping", LandX::endpoint_for_region(r))));
+                // 扇出（LANDX_FANOUT）打开的额外入口也要保活，否则第一次发交易时
+                // 才现做 DNS + TCP，正好落在最不能慢的窗口。后面按 URL 去重。
+                for base in LandX::endpoints_for(r) {
+                    targets.push(KeepAliveTarget::new("LandX", format!("{base}/ping")));
+                }
             }
         }
         #[cfg(feature = "nodeone")]
         if let Some(pool) = &self.nodeone {
             for r in pool.regions() {
-                targets.push(KeepAliveTarget::new("NodeOne", NodeOne::endpoint_for(r).to_string()));
+                // 扇出（NODEONE_FANOUT）打开的额外入口也要保活（如 fra + fra2）。
+                for url in NodeOne::endpoints_for(r) {
+                    targets.push(KeepAliveTarget::new("NodeOne", url));
+                }
             }
         }
         #[cfg(feature = "temporal")]
@@ -1693,6 +1705,9 @@ mod tests {
     }
 
     /// 多地区池：保活必须覆盖**所有**已注册地区，而不只是 own。
+    ///
+    /// 注意：扇出（`ASTRALANE_FANOUT`）打开的额外入口也会出现在列表里，
+    /// 所以这里断言的是「每个地区至少一个」+「列表是去重的」，不是精确条数。
     #[cfg(feature = "astralane")]
     #[test]
     fn keep_alive_covers_every_pooled_region() {
@@ -1707,11 +1722,25 @@ mod tests {
             .build();
 
         let targets = d.keep_alive_targets();
-        assert_eq!(targets.len(), 3, "三个地区三个 URL: {targets:?}");
         for needle in ["fr.gateway", "ams.gateway", "lon.gateway"] {
             assert!(
                 targets.iter().any(|t| t.url.contains(needle)),
                 "缺少 {needle}: {targets:?}"
+            );
+        }
+
+        // 不能有重复的探测 URL（同一 origin 只 ping 一次）
+        let mut urls: Vec<&str> = targets.iter().map(|t| t.url.as_str()).collect();
+        let total = urls.len();
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls.len(), total, "保活列表有重复 URL: {targets:?}");
+
+        // 扇出默认开启时，Global Edge 也应该被保活（否则首包要现做 TLS）
+        if std::env::var("ASTRALANE_FANOUT").is_err() {
+            assert!(
+                targets.iter().any(|t| t.url.contains("edge.astralane.io")),
+                "扇出默认开启，edge 应被保活: {targets:?}"
             );
         }
     }
