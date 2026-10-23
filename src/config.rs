@@ -157,6 +157,16 @@ impl<O: SlotOracle> TxDispacher<O> {
         }
 
         // ── 单地区通道（不参与 fanout）─────────────────────────────────────
+        // FlashBlock QUIC（FLQ1）：有状态的已认证长连接，只能单地区注册。
+        // ⚠️ 与 HTTP 通道共用同一个 key 和**同一个 TPS 限额**，两条同时开会互相抢。
+        #[cfg(feature = "flash_block_quic")]
+        if let Some(key) = env_key("FLASHBLOCK_KEY") {
+            match sol_tx_send::platform_clients::flash_block_quic::FlashBlockQuic::init_with(key, own).await {
+                Ok(c) => b = b.flash_block_quic(c),
+                Err(e) => log::warn!("[TxDispacher] FlashBlockQuic 初始化失败，跳过: {e}"),
+            }
+        }
+
         // Node1 QUIC：启动时连一条长连接 + 认证一次，之后所有交易复用（官方明确要求
         // 不要每笔重新 connect/auth）。因此只能单地区注册，不能用 RegionPool 懒切换。
         #[cfg(feature = "nodeone_quic")]

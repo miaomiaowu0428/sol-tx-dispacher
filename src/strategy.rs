@@ -286,6 +286,8 @@ async fn harmonic_mode<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_no_price!(d.flash_block, tip: tip_strategy);
+    #[cfg(feature = "flash_block_quic")]
+    fire_no_price!(d.flash_block_quic, tip: tip_strategy);
 
     #[cfg(feature = "astralane")]
     fire_no_price!(d.astralane, tip: tip_strategy);
@@ -375,6 +377,8 @@ async fn jito_mode<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_tip_only!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_tip_only!(d.flash_block_quic);
     // Temporal：非 Harmonic 场景只给平台最低 tip（不吃调用方的 tip_strategy）
     #[cfg(feature = "temporal")]
     fire_tip_only!(d.temporal, TEMPORAL_TIP_NON_HARMONIC);
@@ -532,6 +536,11 @@ async fn fallback_mode<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_both!(d.flash_block,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+    #[cfg(feature = "flash_block_quic")]
+    fire_both!(d.flash_block_quic,
         with_price: Some(TipStrategy::Ratio(1.05)),
         no_price:   tip_strategy,
     );
@@ -727,6 +736,8 @@ async fn fallback_cost_mode<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_both!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_both!(d.flash_block_quic);
 
     #[cfg(feature = "nodeone")]
     fire_with_price!(d.nodeone);
@@ -824,6 +835,8 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     // 少数 HTTP 平台
     #[cfg(feature = "flash_block")]
     fire_cheap!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_cheap!(d.flash_block_quic);
     // Jito（靠 tip 排序，便宜但有效）
     #[cfg(feature = "jito")]
     fire_cheap!(d.jito);
@@ -1031,6 +1044,8 @@ async fn fire_all_parallel(
     spawn_fire!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    spawn_fire!(d.flash_block_quic);
     // Temporal：只在 Harmonic 场景吃指定的 min_tip_floor，其余场景只给平台最低 tip
     #[cfg(feature = "temporal")]
     spawn_fire!(d.temporal, !harmonic_scene);
@@ -1176,6 +1191,8 @@ async fn tip_only_jito<O: SlotOracle>(
     fire_tip!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_tip!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_tip!(d.flash_block_quic);
     // Temporal：非 Harmonic 场景只给平台最低 tip
     #[cfg(feature = "temporal")]
     fire_tip!(d.temporal, TEMPORAL_TIP_FLOOR_NON_HARMONIC);
@@ -1397,6 +1414,8 @@ async fn harmonic_mode_v1<O: SlotOracle>(
     fire_v1_no_price!(d.everstake, tip: tip_strategy);
     #[cfg(feature = "flash_block")]
     fire_v1_no_price!(d.flash_block, tip: tip_strategy);
+    #[cfg(feature = "flash_block_quic")]
+    fire_v1_no_price!(d.flash_block_quic, tip: tip_strategy);
     #[cfg(feature = "astralane")]
     fire_v1_no_price!(d.astralane, tip: tip_strategy);
     #[cfg(feature = "nodeone")]
@@ -1470,6 +1489,8 @@ async fn jito_mode_v1<O: SlotOracle>(
     fire_v1_tip_only!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_v1_tip_only!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_v1_tip_only!(d.flash_block_quic);
     // Temporal：非 Harmonic 场景只给平台最低 tip（不吃调用方的 tip_strategy）
     #[cfg(feature = "temporal")]
     fire_v1_tip_only!(d.temporal, TEMPORAL_TIP_NON_HARMONIC);
@@ -1610,6 +1631,11 @@ async fn fallback_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_v1_both!(d.flash_block,
+        with_price: with_price_tip,
+        no_price:   tip_strategy,
+    );
+    #[cfg(feature = "flash_block_quic")]
+    fire_v1_both!(d.flash_block_quic,
         with_price: with_price_tip,
         no_price:   tip_strategy,
     );
@@ -1835,6 +1861,8 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "flash_block")]
     fire_v1_both!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_v1_both!(d.flash_block_quic);
 
     #[cfg(feature = "nodeone")]
     fire_v1_with_price!(d.nodeone);
@@ -2026,6 +2054,8 @@ async fn fire_all_parallel_v1(
     spawn_fire_v1!(d.astralane);
     #[cfg(feature = "flash_block")]
     spawn_fire_v1!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    spawn_fire_v1!(d.flash_block_quic);
     // Temporal：只给平台最低 tip（本函数只服务非 Harmonic 的 TipOnly 路径）
     #[cfg(feature = "temporal")]
     spawn_fire_v1!(d.temporal, true);
@@ -2106,6 +2136,8 @@ pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
     fire_v1_cheap!(d.astralane);
     #[cfg(feature = "flash_block")]
     fire_v1_cheap!(d.flash_block);
+    #[cfg(feature = "flash_block_quic")]
+    fire_v1_cheap!(d.flash_block_quic);
     #[cfg(feature = "jito")]
     fire_v1_cheap!(d.jito);
 

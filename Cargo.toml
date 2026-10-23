@@ -29,6 +29,7 @@ full = [
     "everstake",
     "everstake_quic",
     "flash_block",
+    "flash_block_quic",
     "nodeone",
     "nodeone_quic",
     "blockrazor",
@@ -47,6 +48,10 @@ astralane_quic  = []
 everstake       = []
 everstake_quic  = []
 flash_block     = []
+# FlashBlock QUIC（FLQ1 v1：单向流 + 帧格式 + **无应用回执**）。
+# 刻意**不进 default**：与 HTTP 共用同一个 TPS 限额，超限帧是**静默丢弃**的
+# （没有任何错误/日志可观测）。确认账号 TPS 有余量后，再把它加进构建的 feature 列表。
+flash_block_quic = []
 nodeone         = []
 # Node1 QUIC：UUID 认证 + 双向 stream（与 nodeone HTTP 同 key、同 tip 账户）
 nodeone_quic    = []

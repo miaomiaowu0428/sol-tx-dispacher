@@ -519,6 +519,8 @@ use sol_tx_send::platform_clients::ever_stake::EverStake;
 use sol_tx_send::platform_clients::ever_stake_quic::EverStakeQuic;
 #[cfg(feature = "flash_block")]
 use sol_tx_send::platform_clients::flash_block::FlashBlock;
+#[cfg(feature = "flash_block_quic")]
+use sol_tx_send::platform_clients::flash_block_quic::FlashBlockQuic;
 #[cfg(feature = "harmonic")]
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 #[cfg(feature = "helius")]
@@ -663,6 +665,8 @@ pub struct TxDispacher<O: SlotOracle> {
     pub(crate) everstake_quic: Option<Arc<EverStakeQuic>>,
     #[cfg(feature = "flash_block")]
     pub(crate) flash_block: Option<Arc<RegionPool<FlashBlock>>>,
+    #[cfg(feature = "flash_block_quic")]
+    pub(crate) flash_block_quic: Option<Arc<FlashBlockQuic>>,
     #[cfg(feature = "nodeone")]
     pub(crate) nodeone: Option<Arc<RegionPool<NodeOne>>>,
     #[cfg(feature = "nodeone_quic")]

@@ -19,6 +19,8 @@ use sol_tx_send::platform_clients::ever_stake::EverStake;
 use sol_tx_send::platform_clients::ever_stake_quic::EverStakeQuic;
 #[cfg(feature = "flash_block")]
 use sol_tx_send::platform_clients::flash_block::FlashBlock;
+#[cfg(feature = "flash_block_quic")]
+use sol_tx_send::platform_clients::flash_block_quic::FlashBlockQuic;
 #[cfg(feature = "harmonic")]
 use sol_tx_send::platform_clients::harmonic::HarmonicBlockEngine;
 #[cfg(feature = "helius")]
@@ -60,6 +62,8 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     everstake_quic: Option<Arc<EverStakeQuic>>,
     #[cfg(feature = "flash_block")]
     flash_block: Option<Arc<RegionPool<FlashBlock>>>,
+    #[cfg(feature = "flash_block_quic")]
+    flash_block_quic: Option<Arc<FlashBlockQuic>>,
     #[cfg(feature = "nodeone")]
     nodeone: Option<Arc<RegionPool<NodeOne>>>,
     #[cfg(feature = "nodeone_quic")]
@@ -103,6 +107,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             everstake_quic: None,
             #[cfg(feature = "flash_block")]
             flash_block: None,
+            #[cfg(feature = "flash_block_quic")]
+            flash_block_quic: None,
             #[cfg(feature = "nodeone")]
             nodeone: None,
             #[cfg(feature = "nodeone_quic")]
@@ -163,6 +169,12 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     #[cfg(feature = "everstake_quic")]
     pub fn everstake_quic(mut self, c: EverStakeQuic) -> Self {
         self.everstake_quic = Some(Arc::new(c));
+        self
+    }
+
+    #[cfg(feature = "flash_block_quic")]
+    pub fn flash_block_quic(mut self, c: FlashBlockQuic) -> Self {
+        self.flash_block_quic = Some(Arc::new(c));
         self
     }
 
@@ -357,6 +369,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             everstake_quic: self.everstake_quic,
             #[cfg(feature = "flash_block")]
             flash_block: self.flash_block,
+            #[cfg(feature = "flash_block_quic")]
+            flash_block_quic: self.flash_block_quic,
             #[cfg(feature = "nodeone")]
             nodeone: self.nodeone,
             #[cfg(feature = "nodeone_quic")]
