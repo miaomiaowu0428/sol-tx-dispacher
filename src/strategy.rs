@@ -269,6 +269,9 @@ async fn harmonic_mode<O: SlotOracle>(
     // AstralaneQuic / Temporal：tip_strategy × 0.9，不带 cu_price
     #[cfg(feature = "astralane_quic")]
     fire_no_price!(d.astralane_quic, tip: tip_09);
+    // Node1 QUIC：与同平台 HTTP 通道口径一致，吃调用方 tip（不打 0.9 折扣）
+    #[cfg(feature = "nodeone_quic")]
+    fire_no_price!(d.nodeone_quic, tip: tip_strategy);
 
     // Temporal 在 **Harmonic 场景**吃指定 tip（×0.9），这是注入点保留的唯一路径
     #[cfg(feature = "temporal")]
@@ -365,6 +368,8 @@ async fn jito_mode<O: SlotOracle>(
     // 只发带 tip 的版本：fire_both 平台取 no_price 那笔，fire_with_price 平台跳过
     #[cfg(feature = "astralane_quic")]
     fire_tip_only!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_tip_only!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_tip_only!(d.astralane);
 
@@ -509,6 +514,11 @@ async fn fallback_mode<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_both!(d.astralane_quic,
+        with_price: Some(TipStrategy::Ratio(1.05)),
+        no_price:   tip_strategy,
+    );
+    #[cfg(feature = "nodeone_quic")]
+    fire_both!(d.nodeone_quic,
         with_price: Some(TipStrategy::Ratio(1.05)),
         no_price:   tip_strategy,
     );
@@ -710,6 +720,8 @@ async fn fallback_cost_mode<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_both!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_both!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_both!(d.astralane);
 
@@ -804,6 +816,8 @@ pub(crate) async fn dispatch_cheap<O: SlotOracle>(
     // Astralane：QUIC 与普通版各自独立，对应 feature 打开就发
     #[cfg(feature = "astralane_quic")]
     fire_cheap!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_cheap!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_cheap!(d.astralane);
 
@@ -1011,6 +1025,8 @@ async fn fire_all_parallel(
     spawn_fire!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     spawn_fire!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    spawn_fire!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     spawn_fire!(d.astralane);
     #[cfg(feature = "flash_block")]
@@ -1154,6 +1170,8 @@ async fn tip_only_jito<O: SlotOracle>(
     // Jito 模式：只发 tip-capable 平台
     #[cfg(feature = "astralane_quic")]
     fire_tip!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_tip!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_tip!(d.astralane);
     #[cfg(feature = "flash_block")]
@@ -1367,6 +1385,8 @@ async fn harmonic_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_no_price!(d.astralane_quic, tip: tip_09);
+    #[cfg(feature = "nodeone_quic")]
+    fire_v1_no_price!(d.nodeone_quic, tip: tip_strategy);
     // Temporal 在 **Harmonic 场景**吃指定 tip（×0.9），这是注入点保留的唯一路径
     #[cfg(feature = "temporal")]
     fire_v1_no_price!(d.temporal, tip: tip_09);
@@ -1444,6 +1464,8 @@ async fn jito_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_tip_only!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_v1_tip_only!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_v1_tip_only!(d.astralane);
     #[cfg(feature = "flash_block")]
@@ -1572,6 +1594,11 @@ async fn fallback_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_both!(d.astralane_quic,
+        with_price: with_price_tip,
+        no_price:   tip_strategy,
+    );
+    #[cfg(feature = "nodeone_quic")]
+    fire_v1_both!(d.nodeone_quic,
         with_price: with_price_tip,
         no_price:   tip_strategy,
     );
@@ -1801,6 +1828,8 @@ async fn fallback_cost_mode_v1<O: SlotOracle>(
 
     #[cfg(feature = "astralane_quic")]
     fire_v1_both!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_v1_both!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_v1_both!(d.astralane);
 
@@ -1991,6 +2020,8 @@ async fn fire_all_parallel_v1(
     spawn_fire_v1!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     spawn_fire_v1!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    spawn_fire_v1!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     spawn_fire_v1!(d.astralane);
     #[cfg(feature = "flash_block")]
@@ -2069,6 +2100,8 @@ pub(crate) async fn dispatch_cheap_v1<O: SlotOracle>(
     fire_v1_cheap!(d.everstake);
     #[cfg(feature = "astralane_quic")]
     fire_v1_cheap!(d.astralane_quic);
+    #[cfg(feature = "nodeone_quic")]
+    fire_v1_cheap!(d.nodeone_quic);
     #[cfg(feature = "astralane")]
     fire_v1_cheap!(d.astralane);
     #[cfg(feature = "flash_block")]

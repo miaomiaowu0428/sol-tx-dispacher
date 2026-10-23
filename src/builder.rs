@@ -33,6 +33,8 @@ use sol_tx_send::platform_clients::landx::LandX;
 use sol_tx_send::platform_clients::nextblock::NextBlock;
 #[cfg(feature = "nodeone")]
 use sol_tx_send::platform_clients::nodeone::NodeOne;
+#[cfg(feature = "nodeone_quic")]
+use sol_tx_send::platform_clients::nodeone_quic::NodeOneQuic;
 #[cfg(feature = "stellium")]
 use sol_tx_send::platform_clients::stellium::Stellium;
 #[cfg(feature = "syncro")]
@@ -60,6 +62,8 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     flash_block: Option<Arc<RegionPool<FlashBlock>>>,
     #[cfg(feature = "nodeone")]
     nodeone: Option<Arc<RegionPool<NodeOne>>>,
+    #[cfg(feature = "nodeone_quic")]
+    nodeone_quic: Option<Arc<NodeOneQuic>>,
     #[cfg(feature = "blockrazor")]
     blockrazor: Option<Arc<RegionPool<Blockrazor>>>,
     #[cfg(feature = "temporal")]
@@ -101,6 +105,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             flash_block: None,
             #[cfg(feature = "nodeone")]
             nodeone: None,
+            #[cfg(feature = "nodeone_quic")]
+            nodeone_quic: None,
             #[cfg(feature = "blockrazor")]
             blockrazor: None,
             #[cfg(feature = "temporal")]
@@ -163,6 +169,12 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     #[cfg(feature = "flash_block")]
     pub fn flash_block(mut self, c: FlashBlock) -> Self {
         self.flash_block = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self
+    }
+
+    #[cfg(feature = "nodeone_quic")]
+    pub fn nodeone_quic(mut self, c: NodeOneQuic) -> Self {
+        self.nodeone_quic = Some(Arc::new(c));
         self
     }
 
@@ -347,6 +359,8 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
             flash_block: self.flash_block,
             #[cfg(feature = "nodeone")]
             nodeone: self.nodeone,
+            #[cfg(feature = "nodeone_quic")]
+            nodeone_quic: self.nodeone_quic,
             #[cfg(feature = "blockrazor")]
             blockrazor: self.blockrazor,
             #[cfg(feature = "temporal")]

@@ -11,6 +11,7 @@ default = [
     "everstake_quic",
     "flash_block",
     "nodeone",
+    "nodeone_quic",
     "blockrazor",
     "temporal",
     "helius",
@@ -29,6 +30,7 @@ full = [
     "everstake_quic",
     "flash_block",
     "nodeone",
+    "nodeone_quic",
     "blockrazor",
     "temporal",
     "helius",
@@ -46,6 +48,8 @@ everstake       = []
 everstake_quic  = []
 flash_block     = []
 nodeone         = []
+# Node1 QUIC：UUID 认证 + 双向 stream（与 nodeone HTTP 同 key、同 tip 账户）
+nodeone_quic    = []
 blockrazor      = []
 temporal        = []
 # Helius Sender：Max 与 SWQOS-only 共用同一 key + 同一 feature，同开同关

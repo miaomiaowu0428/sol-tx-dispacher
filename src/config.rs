@@ -157,6 +157,16 @@ impl<O: SlotOracle> TxDispacher<O> {
         }
 
         // ── 单地区通道（不参与 fanout）─────────────────────────────────────
+        // Node1 QUIC：启动时连一条长连接 + 认证一次，之后所有交易复用（官方明确要求
+        // 不要每笔重新 connect/auth）。因此只能单地区注册，不能用 RegionPool 懒切换。
+        #[cfg(feature = "nodeone_quic")]
+        if let Some(key) = env_key("NODEONE_KEY") {
+            match sol_tx_send::platform_clients::nodeone_quic::NodeOneQuic::init_with(key, own).await {
+                Ok(c) => b = b.nodeone_quic(c),
+                Err(e) => log::warn!("[TxDispacher] NodeOneQuic 初始化失败，跳过: {e}"),
+            }
+        }
+
         #[cfg(feature = "astralane_quic")]
         if let Some(key) = env_key("ASTRALANE_KEY") {
             match sol_tx_send::platform_clients::astralane_quic::client::AstralaneQuic::init_with(key, own).await {
