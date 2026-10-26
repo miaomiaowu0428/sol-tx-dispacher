@@ -2,7 +2,7 @@
 
 use crate::TxDispacher;
 use crate::RegionProfile;
-use crate::region_pool::RegionPool;
+use crate::channel_pool::ChannelPool;
 use sol_tx_send::constants::REGION;
 use sol_slot_leader::SlotOracle;
 use std::sync::Arc;
@@ -55,45 +55,45 @@ pub struct TxDispacherBuilder<O: SlotOracle> {
     region_profile: RegionProfile,
 
     #[cfg(feature = "astralane")]
-    astralane: Option<Arc<RegionPool<Astralane>>>,
+    astralane: Option<Arc<ChannelPool<Astralane>>>,
     #[cfg(feature = "astralane_quic")]
-    astralane_quic: Option<Arc<AstralaneQuic>>,
+    astralane_quic: Option<Arc<ChannelPool<AstralaneQuic>>>,
     #[cfg(feature = "everstake")]
-    everstake: Option<Arc<RegionPool<EverStake>>>,
+    everstake: Option<Arc<ChannelPool<EverStake>>>,
     #[cfg(feature = "everstake_quic")]
-    everstake_quic: Option<Arc<EverStakeQuic>>,
+    everstake_quic: Option<Arc<ChannelPool<EverStakeQuic>>>,
     #[cfg(feature = "flash_block")]
-    flash_block: Option<Arc<RegionPool<FlashBlock>>>,
+    flash_block: Option<Arc<ChannelPool<FlashBlock>>>,
     #[cfg(feature = "flash_block_quic")]
-    flash_block_quic: Option<Arc<FlashBlockQuic>>,
+    flash_block_quic: Option<Arc<ChannelPool<FlashBlockQuic>>>,
     #[cfg(feature = "nodeone")]
-    nodeone: Option<Arc<RegionPool<NodeOne>>>,
+    nodeone: Option<Arc<ChannelPool<NodeOne>>>,
     #[cfg(feature = "nodeone_quic")]
-    nodeone_quic: Option<Arc<NodeOneQuic>>,
+    nodeone_quic: Option<Arc<ChannelPool<NodeOneQuic>>>,
     #[cfg(feature = "blockrazor")]
-    blockrazor: Option<Arc<RegionPool<Blockrazor>>>,
+    blockrazor: Option<Arc<ChannelPool<Blockrazor>>>,
     #[cfg(feature = "temporal")]
-    temporal: Option<Arc<RegionPool<Temporal>>>,
+    temporal: Option<Arc<ChannelPool<Temporal>>>,
     #[cfg(feature = "helius")]
-    helius_max: Option<Arc<RegionPool<HeliusMax>>>,
+    helius_max: Option<Arc<ChannelPool<HeliusMax>>>,
     #[cfg(feature = "helius")]
-    helius_swqos: Option<Arc<RegionPool<HeliusSwqos>>>,
+    helius_swqos: Option<Arc<ChannelPool<HeliusSwqos>>>,
     #[cfg(feature = "zeroslot")]
-    zeroslot: Option<Arc<RegionPool<ZeroSlot>>>,
+    zeroslot: Option<Arc<ChannelPool<ZeroSlot>>>,
     #[cfg(feature = "nextblock")]
-    nextblock: Option<Arc<RegionPool<NextBlock>>>,
+    nextblock: Option<Arc<ChannelPool<NextBlock>>>,
     #[cfg(feature = "stellium")]
-    stellium: Option<Arc<RegionPool<Stellium>>>,
+    stellium: Option<Arc<ChannelPool<Stellium>>>,
     #[cfg(feature = "syncro")]
-    syncro: Option<Arc<RegionPool<Syncro>>>,
+    syncro: Option<Arc<ChannelPool<Syncro>>>,
     #[cfg(feature = "jito")]
-    jito: Option<Arc<RegionPool<Jito>>>,
+    jito: Option<Arc<ChannelPool<Jito>>>,
     #[cfg(feature = "landx")]
-    landx: Option<Arc<RegionPool<LandX>>>,
+    landx: Option<Arc<ChannelPool<LandX>>>,
     #[cfg(feature = "landx_udp")]
-    landx_udp: Option<Arc<LandXUdp>>,
+    landx_udp: Option<Arc<ChannelPool<LandXUdp>>>,
     #[cfg(feature = "harmonic")]
-    harmonic: Option<Arc<HarmonicBlockEngine>>,
+    harmonic: Option<Arc<ChannelPool<HarmonicBlockEngine>>>,
 }
 
 impl<O: SlotOracle> TxDispacherBuilder<O> {
@@ -156,91 +156,91 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
 
     #[cfg(feature = "astralane")]
     pub fn astralane(mut self, c: Astralane) -> Self {
-        self.astralane = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.astralane = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "astralane_quic")]
     pub fn astralane_quic(mut self, c: AstralaneQuic) -> Self {
-        self.astralane_quic = Some(Arc::new(c));
+        self.astralane_quic = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "everstake")]
     pub fn everstake(mut self, c: EverStake) -> Self {
-        self.everstake = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.everstake = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "everstake_quic")]
     pub fn everstake_quic(mut self, c: EverStakeQuic) -> Self {
-        self.everstake_quic = Some(Arc::new(c));
+        self.everstake_quic = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "flash_block_quic")]
     pub fn flash_block_quic(mut self, c: FlashBlockQuic) -> Self {
-        self.flash_block_quic = Some(Arc::new(c));
+        self.flash_block_quic = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "flash_block")]
     pub fn flash_block(mut self, c: FlashBlock) -> Self {
-        self.flash_block = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.flash_block = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "nodeone_quic")]
     pub fn nodeone_quic(mut self, c: NodeOneQuic) -> Self {
-        self.nodeone_quic = Some(Arc::new(c));
+        self.nodeone_quic = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "nodeone")]
     pub fn nodeone(mut self, c: NodeOne) -> Self {
-        self.nodeone = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.nodeone = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "blockrazor")]
     pub fn blockrazor(mut self, c: Blockrazor) -> Self {
-        self.blockrazor = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.blockrazor = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "temporal")]
     pub fn temporal(mut self, c: Temporal) -> Self {
-        self.temporal = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.temporal = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "helius")]
     pub fn helius_max(mut self, c: HeliusMax) -> Self {
-        self.helius_max = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.helius_max = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "helius")]
     pub fn helius_swqos(mut self, c: HeliusSwqos) -> Self {
-        self.helius_swqos = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.helius_swqos = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "zeroslot")]
     pub fn zeroslot(mut self, c: ZeroSlot) -> Self {
-        self.zeroslot = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.zeroslot = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "nextblock")]
     pub fn nextblock(mut self, c: NextBlock) -> Self {
-        self.nextblock = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.nextblock = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "stellium")]
     pub fn stellium(mut self, c: Stellium) -> Self {
-        self.stellium = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.stellium = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
@@ -250,118 +250,160 @@ impl<O: SlotOracle> TxDispacherBuilder<O> {
     /// 见 `SendRoute::P2pTurbo`。
     #[cfg(feature = "syncro")]
     pub fn syncro(mut self, c: Syncro) -> Self {
-        self.syncro = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.syncro = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "jito")]
     pub fn jito(mut self, c: Jito) -> Self {
-        self.jito = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.jito = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     /// 注入 **LandX**（HTTP JSON-RPC，API key 放 URL path）。
     #[cfg(feature = "landx_udp")]
     pub fn landx_udp(mut self, c: LandXUdp) -> Self {
-        self.landx_udp = Some(Arc::new(c));
+        self.landx_udp = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "landx")]
     pub fn landx(mut self, c: LandX) -> Self {
-        self.landx = Some(Arc::new(RegionPool::single(*REGION, c)));
+        self.landx = Some(Arc::new(ChannelPool::single(*REGION, c)));
         self
     }
 
     #[cfg(feature = "harmonic")]
     pub fn harmonic(mut self, c: HarmonicBlockEngine) -> Self {
-        self.harmonic = Some(Arc::new(c));
+        self.harmonic = Some(Arc::new(ChannelPool::single(*REGION, c)));
+        self
+    }
+
+    /// 注入 **Harmonic** 的多 searcher 池（备用 searcher key 必须是对方已登记的）。
+    #[cfg(feature = "harmonic")]
+    pub fn harmonic_pool(mut self, p: impl Into<ChannelPool<HarmonicBlockEngine>>) -> Self {
+        self.harmonic = Some(Arc::new(p.into()));
         self
     }
 
 
-    // ── 多地区 setter（接收已按 fanout 构造好的 RegionPool）──────────────
+    // ── 多地区 setter（接收已按 fanout 构造好的 RegionPool，或带 alt key 的 ChannelPool）
     #[cfg(feature = "astralane")]
-    pub fn astralane_pool(mut self, p: RegionPool<Astralane>) -> Self {
-        self.astralane = Some(Arc::new(p));
+    pub fn astralane_pool(mut self, p: impl Into<ChannelPool<Astralane>>) -> Self {
+        self.astralane = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "everstake")]
-    pub fn everstake_pool(mut self, p: RegionPool<EverStake>) -> Self {
-        self.everstake = Some(Arc::new(p));
+    pub fn everstake_pool(mut self, p: impl Into<ChannelPool<EverStake>>) -> Self {
+        self.everstake = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "flash_block")]
-    pub fn flash_block_pool(mut self, p: RegionPool<FlashBlock>) -> Self {
-        self.flash_block = Some(Arc::new(p));
+    pub fn flash_block_pool(mut self, p: impl Into<ChannelPool<FlashBlock>>) -> Self {
+        self.flash_block = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "nodeone")]
-    pub fn nodeone_pool(mut self, p: RegionPool<NodeOne>) -> Self {
-        self.nodeone = Some(Arc::new(p));
+    pub fn nodeone_pool(mut self, p: impl Into<ChannelPool<NodeOne>>) -> Self {
+        self.nodeone = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "blockrazor")]
-    pub fn blockrazor_pool(mut self, p: RegionPool<Blockrazor>) -> Self {
-        self.blockrazor = Some(Arc::new(p));
+    pub fn blockrazor_pool(mut self, p: impl Into<ChannelPool<Blockrazor>>) -> Self {
+        self.blockrazor = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "temporal")]
-    pub fn temporal_pool(mut self, p: RegionPool<Temporal>) -> Self {
-        self.temporal = Some(Arc::new(p));
+    pub fn temporal_pool(mut self, p: impl Into<ChannelPool<Temporal>>) -> Self {
+        self.temporal = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "helius")]
-    pub fn helius_max_pool(mut self, p: RegionPool<HeliusMax>) -> Self {
-        self.helius_max = Some(Arc::new(p));
+    pub fn helius_max_pool(mut self, p: impl Into<ChannelPool<HeliusMax>>) -> Self {
+        self.helius_max = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "helius")]
-    pub fn helius_swqos_pool(mut self, p: RegionPool<HeliusSwqos>) -> Self {
-        self.helius_swqos = Some(Arc::new(p));
+    pub fn helius_swqos_pool(mut self, p: impl Into<ChannelPool<HeliusSwqos>>) -> Self {
+        self.helius_swqos = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "zeroslot")]
-    pub fn zeroslot_pool(mut self, p: RegionPool<ZeroSlot>) -> Self {
-        self.zeroslot = Some(Arc::new(p));
+    pub fn zeroslot_pool(mut self, p: impl Into<ChannelPool<ZeroSlot>>) -> Self {
+        self.zeroslot = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "nextblock")]
-    pub fn nextblock_pool(mut self, p: RegionPool<NextBlock>) -> Self {
-        self.nextblock = Some(Arc::new(p));
+    pub fn nextblock_pool(mut self, p: impl Into<ChannelPool<NextBlock>>) -> Self {
+        self.nextblock = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "stellium")]
-    pub fn stellium_pool(mut self, p: RegionPool<Stellium>) -> Self {
-        self.stellium = Some(Arc::new(p));
+    pub fn stellium_pool(mut self, p: impl Into<ChannelPool<Stellium>>) -> Self {
+        self.stellium = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "syncro")]
-    pub fn syncro_pool(mut self, p: RegionPool<Syncro>) -> Self {
-        self.syncro = Some(Arc::new(p));
+    pub fn syncro_pool(mut self, p: impl Into<ChannelPool<Syncro>>) -> Self {
+        self.syncro = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "jito")]
-    pub fn jito_pool(mut self, p: RegionPool<Jito>) -> Self {
-        self.jito = Some(Arc::new(p));
+    pub fn jito_pool(mut self, p: impl Into<ChannelPool<Jito>>) -> Self {
+        self.jito = Some(Arc::new(p.into()));
         self
     }
 
     #[cfg(feature = "landx")]
-    pub fn landx_pool(mut self, p: RegionPool<LandX>) -> Self {
-        self.landx = Some(Arc::new(p));
+    pub fn landx_pool(mut self, p: impl Into<ChannelPool<LandX>>) -> Self {
+        self.landx = Some(Arc::new(p.into()));
+        self
+    }
+
+    // ── 单实例通道的池化 setter（QUIC / UDP：单地区，不做地区扇出）─────────
+    //
+    // 这些通道本身「一个 socket / 一条长连接」，多地区会引入重连/预热问题，
+    // 所以池里每个 key 只放一个实例；key 维度仍然成立（alt key = 第二条连接）。
+
+    #[cfg(feature = "astralane_quic")]
+    pub fn astralane_quic_pool(mut self, p: impl Into<ChannelPool<AstralaneQuic>>) -> Self {
+        self.astralane_quic = Some(Arc::new(p.into()));
+        self
+    }
+
+    #[cfg(feature = "everstake_quic")]
+    pub fn everstake_quic_pool(mut self, p: impl Into<ChannelPool<EverStakeQuic>>) -> Self {
+        self.everstake_quic = Some(Arc::new(p.into()));
+        self
+    }
+
+    #[cfg(feature = "flash_block_quic")]
+    pub fn flash_block_quic_pool(mut self, p: impl Into<ChannelPool<FlashBlockQuic>>) -> Self {
+        self.flash_block_quic = Some(Arc::new(p.into()));
+        self
+    }
+
+    #[cfg(feature = "nodeone_quic")]
+    pub fn nodeone_quic_pool(mut self, p: impl Into<ChannelPool<NodeOneQuic>>) -> Self {
+        self.nodeone_quic = Some(Arc::new(p.into()));
+        self
+    }
+
+    #[cfg(feature = "landx_udp")]
+    pub fn landx_udp_pool(mut self, p: impl Into<ChannelPool<LandXUdp>>) -> Self {
+        self.landx_udp = Some(Arc::new(p.into()));
         self
     }
 

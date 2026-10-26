@@ -24,6 +24,7 @@
 mod builder;
 mod config;
 mod bundle;
+mod channel_pool;
 mod context;
 mod fifo;
 mod fire;
@@ -32,6 +33,10 @@ mod region_pool;
 mod strategy;
 
 pub use builder::TxDispacherBuilder;
+pub use channel_pool::{
+    ChannelPool, KeyProfile, SEND_KEY_PROFILE, current_key_profile, with_key_profile,
+};
+pub use config::KEY_PROFILES_ENV;
 pub use region_plan::{
     DEFAULT_PLAN, PLAN_PATH_ENV, Policy, RegionPlan, RegionProfile, SUPPORTED_VERSION,
 };
@@ -616,34 +621,40 @@ pub struct ChannelInfo {
     pub transport: &'static str,
     /// 该通道实际开了哪些入口地区；空表示不按地区池发送（如 Harmonic）。
     pub regions: Vec<Region>,
+    /// 该通道额外注册了哪些 key profile（空 = 只有默认 key）。
+    ///
+    /// 只用于启动日志 / 自检：profile 不改变保活目标（见 [`ChannelPool`] 文档）。
+    pub key_profiles: Vec<String>,
 }
 
 impl ChannelInfo {
-    fn pool<T>(platform: &'static str, transport: &'static str, pool: &RegionPool<T>) -> Self {
-        let mut regions: Vec<Region> = pool.regions().collect();
-        // HashMap 无序；按 Region::ALL 的固定顺序输出，保证日志可对比。
-        regions.sort_by_key(|r| Region::ALL.iter().position(|x| x == r).unwrap_or(usize::MAX));
+    fn channeled<T>(
+        platform: &'static str,
+        transport: &'static str,
+        pool: &ChannelPool<T>,
+        regions: Vec<Region>,
+    ) -> Self {
         Self {
             platform,
             transport,
             regions,
+            key_profiles: pool.alt_profiles().iter().map(|p| p.to_string()).collect(),
         }
     }
 
-    fn single(platform: &'static str, transport: &'static str) -> Self {
-        Self {
-            platform,
-            transport,
-            regions: vec![*sol_tx_send::constants::REGION],
-        }
+    fn pool<T>(platform: &'static str, transport: &'static str, pool: &ChannelPool<T>) -> Self {
+        let mut regions: Vec<Region> = pool.regions().collect();
+        // HashMap 无序；按 Region::ALL 的固定顺序输出，保证日志可对比。
+        regions.sort_by_key(|r| Region::ALL.iter().position(|x| x == r).unwrap_or(usize::MAX));
+        Self::channeled(platform, transport, pool, regions)
     }
 
-    fn multi_endpoint(platform: &'static str, transport: &'static str) -> Self {
-        Self {
-            platform,
-            transport,
-            regions: Vec::new(),
-        }
+    fn single<T>(platform: &'static str, transport: &'static str, pool: &ChannelPool<T>) -> Self {
+        Self::channeled(platform, transport, pool, vec![*sol_tx_send::constants::REGION])
+    }
+
+    fn multi_endpoint<T>(platform: &'static str, transport: &'static str, pool: &ChannelPool<T>) -> Self {
+        Self::channeled(platform, transport, pool, Vec::new())
     }
 }
 
@@ -658,51 +669,67 @@ pub struct TxDispacher<O: SlotOracle> {
     region_profile: RegionProfile,
 
     #[cfg(feature = "astralane")]
-    pub(crate) astralane: Option<Arc<RegionPool<Astralane>>>,
+    pub(crate) astralane: Option<Arc<ChannelPool<Astralane>>>,
     #[cfg(feature = "astralane_quic")]
-    pub(crate) astralane_quic: Option<Arc<AstralaneQuic>>,
+    pub(crate) astralane_quic: Option<Arc<ChannelPool<AstralaneQuic>>>,
     #[cfg(feature = "everstake")]
-    pub(crate) everstake: Option<Arc<RegionPool<EverStake>>>,
+    pub(crate) everstake: Option<Arc<ChannelPool<EverStake>>>,
     #[cfg(feature = "everstake_quic")]
-    pub(crate) everstake_quic: Option<Arc<EverStakeQuic>>,
+    pub(crate) everstake_quic: Option<Arc<ChannelPool<EverStakeQuic>>>,
     #[cfg(feature = "flash_block")]
-    pub(crate) flash_block: Option<Arc<RegionPool<FlashBlock>>>,
+    pub(crate) flash_block: Option<Arc<ChannelPool<FlashBlock>>>,
     #[cfg(feature = "flash_block_quic")]
-    pub(crate) flash_block_quic: Option<Arc<FlashBlockQuic>>,
+    pub(crate) flash_block_quic: Option<Arc<ChannelPool<FlashBlockQuic>>>,
     #[cfg(feature = "nodeone")]
-    pub(crate) nodeone: Option<Arc<RegionPool<NodeOne>>>,
+    pub(crate) nodeone: Option<Arc<ChannelPool<NodeOne>>>,
     #[cfg(feature = "nodeone_quic")]
-    pub(crate) nodeone_quic: Option<Arc<NodeOneQuic>>,
+    pub(crate) nodeone_quic: Option<Arc<ChannelPool<NodeOneQuic>>>,
     #[cfg(feature = "blockrazor")]
-    pub(crate) blockrazor: Option<Arc<RegionPool<Blockrazor>>>,
+    pub(crate) blockrazor: Option<Arc<ChannelPool<Blockrazor>>>,
     #[cfg(feature = "temporal")]
-    pub(crate) temporal: Option<Arc<RegionPool<Temporal>>>,
+    pub(crate) temporal: Option<Arc<ChannelPool<Temporal>>>,
     #[cfg(feature = "helius")]
-    pub(crate) helius_max: Option<Arc<RegionPool<HeliusMax>>>,
+    pub(crate) helius_max: Option<Arc<ChannelPool<HeliusMax>>>,
     #[cfg(feature = "helius")]
-    pub(crate) helius_swqos: Option<Arc<RegionPool<HeliusSwqos>>>,
+    pub(crate) helius_swqos: Option<Arc<ChannelPool<HeliusSwqos>>>,
     #[cfg(feature = "zeroslot")]
-    pub(crate) zeroslot: Option<Arc<RegionPool<ZeroSlot>>>,
+    pub(crate) zeroslot: Option<Arc<ChannelPool<ZeroSlot>>>,
     #[cfg(feature = "nextblock")]
-    pub(crate) nextblock: Option<Arc<RegionPool<NextBlock>>>,
+    pub(crate) nextblock: Option<Arc<ChannelPool<NextBlock>>>,
     #[cfg(feature = "stellium")]
-    pub(crate) stellium: Option<Arc<RegionPool<Stellium>>>,
+    pub(crate) stellium: Option<Arc<ChannelPool<Stellium>>>,
     #[cfg(feature = "syncro")]
-    pub(crate) syncro: Option<Arc<RegionPool<Syncro>>>,
+    pub(crate) syncro: Option<Arc<ChannelPool<Syncro>>>,
     #[cfg(feature = "jito")]
-    pub(crate) jito: Option<Arc<RegionPool<Jito>>>,
+    pub(crate) jito: Option<Arc<ChannelPool<Jito>>>,
     #[cfg(feature = "landx")]
-    pub(crate) landx: Option<Arc<RegionPool<LandX>>>,
+    pub(crate) landx: Option<Arc<ChannelPool<LandX>>>,
     #[cfg(feature = "landx_udp")]
-    pub(crate) landx_udp: Option<Arc<LandXUdp>>,
+    pub(crate) landx_udp: Option<Arc<ChannelPool<LandXUdp>>>,
     #[cfg(feature = "harmonic")]
-    pub(crate) harmonic: Option<Arc<HarmonicBlockEngine>>,
+    pub(crate) harmonic: Option<Arc<ChannelPool<HarmonicBlockEngine>>>,
 }
 
 /// 将 anyhow::Error 转为 TxConfirmError（downcast 根因，downcast 不出当 Other）
 fn into_tx_confirm_err(e: anyhow::Error) -> TxConfirmError {
     e.downcast::<TxConfirmError>()
         .unwrap_or_else(|e| TxConfirmError::Other(format!("{:#}", e)))
+}
+
+/// 按 [`SendContext::key_profile`] 把**一次发送**放进对应 key profile 的作用域。
+///
+/// 没有设置 profile 时不 scope，默认路径的行为与加这个功能之前逐字节一致
+/// （连一次 task-local 读都不多）。`fire_client` 会在 `tokio::spawn` 时再带进去。
+async fn scoped_by_ctx<F: std::future::Future>(ctx: &SendContext, fut: F) -> F::Output {
+    crate::channel_pool::with_optional_key_profile(ctx.key_profile.clone(), fut).await
+}
+
+/// 同步版 [`scoped_by_ctx`]（`send_flashblock_only*` 这类 fire-and-forget 用）。
+fn sync_scoped_by_ctx<R>(ctx: &SendContext, f: impl FnOnce() -> R) -> R {
+    match &ctx.key_profile {
+        Some(p) => crate::channel_pool::sync_with_key_profile(p.clone(), f),
+        None => f(),
+    }
 }
 
 /// 打印一次发送的 leader 决策快照。
@@ -746,21 +773,23 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// 注：SWQOS-only 档位不支持 bundle，故不在此列。
     pub fn bundle_sender(&self) -> MultiBundleSender {
         let mut senders: Vec<Box<dyn BundleSender>> = Vec::new();
+        // 取「当前 key profile 命中」的那个实例池；bundle 调用方可在
+        // `with_key_profile(..)` 作用域里调用本方法切换 key，默认走 primary。
         #[cfg(feature = "jito")]
         if let Some(c) = &self.jito {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "astralane")]
         if let Some(c) = &self.astralane {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "flash_block")]
         if let Some(c) = &self.flash_block {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "helius")]
         if let Some(c) = &self.helius_max {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         MultiBundleSender::new(senders)
     }
@@ -775,21 +804,23 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// 还是必须拆成多笔 bundle —— 只是每笔内部改用 V1 编码。
     pub fn bundle_sender_v1(&self) -> MultiBundleSenderV1 {
         let mut senders: Vec<Box<dyn BundleSender>> = Vec::new();
+        // 取「当前 key profile 命中」的那个实例池；bundle 调用方可在
+        // `with_key_profile(..)` 作用域里调用本方法切换 key，默认走 primary。
         #[cfg(feature = "jito")]
         if let Some(c) = &self.jito {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "astralane")]
         if let Some(c) = &self.astralane {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "flash_block")]
         if let Some(c) = &self.flash_block {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         #[cfg(feature = "helius")]
         if let Some(c) = &self.helius_max {
-            senders.push(Box::new(c.as_ref().clone()));
+            senders.push(Box::new(c.current().as_ref().clone()));
         }
         MultiBundleSenderV1::new(senders)
     }
@@ -812,14 +843,14 @@ impl<O: SlotOracle> TxDispacher<O> {
         #[cfg(feature = "astralane")]
         push_pool!(self.astralane, "Astralane", "HTTP");
         #[cfg(feature = "astralane_quic")]
-        if self.astralane_quic.is_some() {
-            out.push(ChannelInfo::single("AstralaneQuic", "QUIC"));
+        if let Some(pool) = &self.astralane_quic {
+            out.push(ChannelInfo::single("AstralaneQuic", "QUIC", pool));
         }
         #[cfg(feature = "everstake")]
         push_pool!(self.everstake, "EverStake", "HTTP");
         #[cfg(feature = "everstake_quic")]
-        if self.everstake_quic.is_some() {
-            out.push(ChannelInfo::single("EverStakeQuic", "QUIC"));
+        if let Some(pool) = &self.everstake_quic {
+            out.push(ChannelInfo::single("EverStakeQuic", "QUIC", pool));
         }
         #[cfg(feature = "flash_block")]
         push_pool!(self.flash_block, "FlashBlock", "HTTP");
@@ -845,9 +876,21 @@ impl<O: SlotOracle> TxDispacher<O> {
         push_pool!(self.jito, "Jito", "HTTP");
         #[cfg(feature = "landx")]
         push_pool!(self.landx, "LandX", "HTTP");
+        #[cfg(feature = "landx_udp")]
+        if let Some(pool) = &self.landx_udp {
+            out.push(ChannelInfo::single("LandXUdp", "UDP", pool));
+        }
+        #[cfg(feature = "nodeone_quic")]
+        if let Some(pool) = &self.nodeone_quic {
+            out.push(ChannelInfo::single("NodeOneQuic", "QUIC", pool));
+        }
+        #[cfg(feature = "flash_block_quic")]
+        if let Some(pool) = &self.flash_block_quic {
+            out.push(ChannelInfo::single("FlashBlockQuic", "QUIC", pool));
+        }
         #[cfg(feature = "harmonic")]
-        if self.harmonic.is_some() {
-            out.push(ChannelInfo::multi_endpoint("Harmonic", "gRPC"));
+        if let Some(pool) = &self.harmonic {
+            out.push(ChannelInfo::multi_endpoint("Harmonic", "gRPC", pool));
         }
 
         out
@@ -863,10 +906,11 @@ impl<O: SlotOracle> TxDispacher<O> {
         log::info!("[TxDispacher] 已构造 {} 个发送通道:", channels.len());
         for c in &channels {
             log::info!(
-                "[TxDispacher]   channel platform={} transport={} regions={:?}",
+                "[TxDispacher]   channel platform={} transport={} regions={:?} key_profiles={:?}",
                 c.platform,
                 c.transport,
-                c.regions
+                c.regions,
+                c.key_profiles
             );
         }
     }
@@ -882,6 +926,14 @@ impl<O: SlotOracle> TxDispacher<O> {
     /// - 退化到同一 URL 的目标按 URL 去重（平台在那一带没机房时很常见）；
     /// - gRPC（Harmonic）与 QUIC（AstralaneQuic / EverStakeQuic）不在列：
     ///   它们在连接层各自保活（见对应客户端）。
+    ///
+    /// # 备用 key（key profile）不影响这里
+    ///
+    /// 备用 key 只是换鉴权凭据，**endpoint 不变**（Astralane 在 header、LandX 在提交
+    /// path 但保活探 `<base>/ping`、其余在 header/body），且所有 HTTP client 共用
+    /// 同一个全局连接池。所以这里按 (平台, 地区) 展开即可：给 alt key 再 ping 一遍
+    /// 同一 origin 纯属浪费，还会让保活任务数翻倍。单测
+    /// `alt_key_profile_does_not_change_keep_alive_targets` 锁住这个不变量。
     pub fn keep_alive_targets(&self) -> Vec<KeepAliveTarget> {
         let mut targets: Vec<KeepAliveTarget> = Vec::new();
 
@@ -1007,6 +1059,28 @@ impl<O: SlotOracle> TxDispacher<O> {
         tokio::spawn(run_keep_alive(targets))
     }
 
+    /// 在指定 **key profile** 的作用域里执行一段发送逻辑。
+    ///
+    /// 绝大多数场景用 [`SendContext::with_key_profile`] 就够了（`send*` 入口会自动
+    /// scope）；这个方法是给「自己组合发送」的调用方准备的，比如先拿 bundle sender
+    /// 再自己 `send_bundle`：
+    ///
+    /// ```rust,ignore
+    /// d.with_key_profile("alt", async {
+    ///     d.bundle_sender_v1().append(ixs, &ctx).send(30).await
+    /// })
+    /// .await
+    /// ```
+    ///
+    /// 作用域只覆盖这次调用；作用域外（以及其它任务）继续用默认 key。
+    pub async fn with_key_profile<T>(
+        &self,
+        profile: impl Into<KeyProfile>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        crate::channel_pool::with_key_profile(profile, fut).await
+    }
+
     /// 只用 **FlashBlock** 发一笔（不挑 leader、不参与 tip/cu_price 竞价）。
     ///
     /// tip 走平台最低、cu 按传入；fire-and-forget，不等确认 ——
@@ -1019,9 +1093,12 @@ impl<O: SlotOracle> TxDispacher<O> {
         cu: (Option<u32>, Option<u64>),
     ) -> Option<solana_sdk::signature::Signature> {
         let client = self.flash_block.as_ref()?;
-        let mut sigs = ahash::AHashSet::new();
-        fire::fire_client(client, ixs, &ctx.payer, None, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
-        sigs.into_iter().next()
+        // 同步 fire-and-forget 路径没有 async scope，用 sync_scope 把 key profile 带进去。
+        sync_scoped_by_ctx(ctx, || {
+            let mut sigs = ahash::AHashSet::new();
+            fire::fire_client(client, ixs, &ctx.payer, None, &ctx.hash_param, &cu, &ctx.alt, None, &mut sigs);
+            sigs.into_iter().next()
+        })
     }
 
     /// 只读一次 leader 缓存，派生本次发送的全部决策。
@@ -1128,20 +1205,30 @@ impl<O: SlotOracle> TxDispacher<O> {
         let plan = self.plan(target_slot);
         log_send_plan("send", &plan);
         log::info!(
-            "[TxDispacher] send mode=v0 tip_strategy={:?} cu={:?} timeout={}s",
+            "[TxDispacher] send mode=v0 key_profile={:?} tip_strategy={:?} cu={:?} timeout={}s",
+            ctx.key_profile.as_ref().map(|p| p.as_str()),
             tip_strategy,
             cu,
             confirm_timeout_secs
         );
         // FIFO leader：tip=None（下游折成平台最低 tip）、cu_limit 保留、cu_price=None（不参与 cu_price 竞价）。
         if plan.fifo {
-            return with_plan_ctx(&plan, strategy::dispatch(self, ixs, ctx, plan.route, None, (cu.0, None), confirm_timeout_secs))
-                .await
-                .map_err(into_tx_confirm_err);
-        }
-        with_plan_ctx(&plan, strategy::dispatch(self, ixs, ctx, plan.route, tip_strategy, cu, confirm_timeout_secs))
+            return scoped_by_ctx(
+                ctx,
+                with_plan_ctx(
+                    &plan,
+                    strategy::dispatch(self, ixs, ctx, plan.route, None, (cu.0, None), confirm_timeout_secs),
+                ),
+            )
             .await
-            .map_err(into_tx_confirm_err)
+            .map_err(into_tx_confirm_err);
+        }
+        scoped_by_ctx(
+            ctx,
+            with_plan_ctx(&plan, strategy::dispatch(self, ixs, ctx, plan.route, tip_strategy, cu, confirm_timeout_secs)),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// 低成本发送——不走 oracle 路由，只发少数平台单轮。
@@ -1157,15 +1244,22 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         log::info!(
-            "[TxDispacher] send_cheap mode=cheap ingress={} tip_strategy={:?} cu={:?} timeout={}s",
+            "[TxDispacher] send_cheap mode=cheap ingress={} key_profile={:?} tip_strategy={:?} cu={:?} timeout={}s",
             self.region_profile.own_region,
+            ctx.key_profile.as_ref().map(|p| p.as_str()),
             tip_strategy,
             cu,
             confirm_timeout_secs
         );
-        crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs))
-            .await
-            .map_err(into_tx_confirm_err)
+        scoped_by_ctx(
+            ctx,
+            crate::region_pool::with_region(
+                self.region_profile.own_region,
+                strategy::dispatch_cheap(self, ixs, ctx, tip_strategy, cu, confirm_timeout_secs),
+            ),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// 纯 tip 竞价发送——不参与 cu_price 竞争，只靠 SOL tip 抢排序。
@@ -1185,14 +1279,21 @@ impl<O: SlotOracle> TxDispacher<O> {
         let plan = self.plan(target_slot);
         log_send_plan("send_tip_only", &plan);
         log::info!(
-            "[TxDispacher] send_tip_only mode=tip_only tip_floor={} cu_limit={} timeout={}s",
+            "[TxDispacher] send_tip_only mode=tip_only key_profile={:?} tip_floor={} cu_limit={} timeout={}s",
+            ctx.key_profile.as_ref().map(|p| p.as_str()),
             min_tip_floor,
             cu_limit,
             confirm_timeout_secs
         );
-        with_plan_ctx(&plan, strategy::dispatch_tip_only(self, ixs, ctx, plan.route, min_tip_floor, cu_limit, confirm_timeout_secs))
-            .await
-            .map_err(into_tx_confirm_err)
+        scoped_by_ctx(
+            ctx,
+            with_plan_ctx(
+                &plan,
+                strategy::dispatch_tip_only(self, ixs, ctx, plan.route, min_tip_floor, cu_limit, confirm_timeout_secs),
+            ),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// 单预算竞价发送——把 tip/cu_price 二维参数合并为单个 cost 预算。
@@ -1217,7 +1318,8 @@ impl<O: SlotOracle> TxDispacher<O> {
         let plan = self.plan(target_slot);
         log_send_plan("send_with_cost", &plan);
         log::info!(
-            "[TxDispacher] send_with_cost mode=cost cost={} cu_limit={} tip_rate={} timeout={}s",
+            "[TxDispacher] send_with_cost mode=cost key_profile={:?} cost={} cu_limit={} tip_rate={} timeout={}s",
+            ctx.key_profile.as_ref().map(|p| p.as_str()),
             config.cost_amount,
             config.cu_limit,
             config.tip_rate,
@@ -1226,24 +1328,30 @@ impl<O: SlotOracle> TxDispacher<O> {
         // FIFO leader：不参与 tip/cu_price 竞价（靠先到先得），cost 不生效，
         // 只保留 cu_limit，tip=None、cu_price=None。
         if plan.fifo {
-            return with_plan_ctx(
-                &plan,
-                strategy::dispatch(
-                    self,
-                    ixs,
-                    ctx,
-                    plan.route,
-                    None,
-                    (Some(config.cu_limit), None),
-                    confirm_timeout_secs,
+            return scoped_by_ctx(
+                ctx,
+                with_plan_ctx(
+                    &plan,
+                    strategy::dispatch(
+                        self,
+                        ixs,
+                        ctx,
+                        plan.route,
+                        None,
+                        (Some(config.cu_limit), None),
+                        confirm_timeout_secs,
+                    ),
                 ),
             )
             .await
             .map_err(into_tx_confirm_err);
         }
-        with_plan_ctx(&plan, strategy::dispatch_with_cost(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
-            .await
-            .map_err(into_tx_confirm_err)
+        scoped_by_ctx(
+            ctx,
+            with_plan_ctx(&plan, strategy::dispatch_with_cost(self, ixs, ctx, plan.route, config, confirm_timeout_secs)),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1267,15 +1375,22 @@ impl<O: SlotOracle> TxDispacher<O> {
         confirm_timeout_secs: u64,
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         log::info!(
-            "[TxDispacher] send_cheap_v1 mode=cheap_v1 ingress={} tip_strategy={:?} config={:?} timeout={}s",
+            "[TxDispacher] send_cheap_v1 mode=cheap_v1 ingress={} key_profile={:?} tip_strategy={:?} config={:?} timeout={}s",
             self.region_profile.own_region,
+            ctx.key_profile.as_ref().map(|p| p.as_str()),
             tip_strategy,
             config,
             confirm_timeout_secs
         );
-        crate::region_pool::with_region(self.region_profile.own_region, strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs))
-            .await
-            .map_err(into_tx_confirm_err)
+        scoped_by_ctx(
+            ctx,
+            crate::region_pool::with_region(
+                self.region_profile.own_region,
+                strategy::dispatch_cheap_v1(self, ixs, ctx, tip_strategy, config, confirm_timeout_secs),
+            ),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// **V1 统一发送入口** —— V1 侧唯一对外 API（与 V0 的 [`Self::send`] 对称）。
@@ -1307,7 +1422,8 @@ impl<O: SlotOracle> TxDispacher<O> {
                 // 保底 gas：只在 Fallback 的 tip 竞价腿落地（其余 mode 忽略）
                 let tip_leg_gas = cfg.gas_opt();
                 log::info!(
-                    "[TxDispacher] send_v1 mode=fixed_tip tip_strategy={:?} gas={:?} fifo={} cu_limit={} loaded_accounts_data_size_limit={:?} heap_size={:?} timeout={}s",
+                    "[TxDispacher] send_v1 mode=fixed_tip key_profile={:?} tip_strategy={:?} gas={:?} fifo={} cu_limit={} loaded_accounts_data_size_limit={:?} heap_size={:?} timeout={}s",
+                    ctx.key_profile.as_ref().map(|p| p.as_str()),
                     tip_strategy,
                     tip_leg_gas,
                     plan.fifo,
@@ -1320,17 +1436,20 @@ impl<O: SlotOracle> TxDispacher<O> {
                 //
                 // ⚠️ 2026-09-23 策略组改了 FIFO 的定义 —— 旧口径是「不参与竞价」
                 //    （tip=None），现在改成「照常给 tip，只是不额外付 gas」。
-                with_plan_ctx(
-                    &plan,
-                    strategy::dispatch_v1(
-                        self,
-                        ixs,
-                        ctx,
-                        plan.route,
-                        tip_strategy,
-                        cfg.as_tip_config(),
-                        if plan.fifo { None } else { tip_leg_gas },
-                        confirm_timeout_secs,
+                scoped_by_ctx(
+                    ctx,
+                    with_plan_ctx(
+                        &plan,
+                        strategy::dispatch_v1(
+                            self,
+                            ixs,
+                            ctx,
+                            plan.route,
+                            tip_strategy,
+                            cfg.as_tip_config(),
+                            if plan.fifo { None } else { tip_leg_gas },
+                            confirm_timeout_secs,
+                        ),
                     ),
                 )
                 .await
@@ -1338,7 +1457,8 @@ impl<O: SlotOracle> TxDispacher<O> {
             }
             SpendMode::Cost(cost) => {
                 log::info!(
-                    "[TxDispacher] send_v1 mode=cost cost={cost} cu_limit={} tip_rate={} timeout={}s",
+                    "[TxDispacher] send_v1 mode=cost key_profile={:?} cost={cost} cu_limit={} tip_rate={} timeout={}s",
+                    ctx.key_profile.as_ref().map(|p| p.as_str()),
                     cfg.cu_limit,
                     cfg.tip_rate,
                     confirm_timeout_secs
@@ -1365,30 +1485,36 @@ impl<O: SlotOracle> TxDispacher<O> {
     ) -> Result<(solana_sdk::signature::Signature, grpc_client::TransactionFormat), TxConfirmError> {
         // FIFO leader：不参与竞价，cost 不生效（priority_fee=None 且不给 tip）
         if plan.fifo {
-            return with_plan_ctx(
-                &plan,
-                strategy::dispatch_v1(
-                    self,
-                    ixs,
-                    ctx,
-                    plan.route,
-                    None,
-                    // FIFO 下只需 cu_limit，priority_fee 置 None
-                    sol_tx_send::platform_clients::V1TxConfig {
-                        priority_fee: None,
-                        compute_unit_limit: Some(config.cu_limit),
-                        ..Default::default()
-                    },
-                    None, // 保底 gas：FIFO 下不给
-                    confirm_timeout_secs,
+            return scoped_by_ctx(
+                ctx,
+                with_plan_ctx(
+                    &plan,
+                    strategy::dispatch_v1(
+                        self,
+                        ixs,
+                        ctx,
+                        plan.route,
+                        None,
+                        // FIFO 下只需 cu_limit，priority_fee 置 None
+                        sol_tx_send::platform_clients::V1TxConfig {
+                            priority_fee: None,
+                            compute_unit_limit: Some(config.cu_limit),
+                            ..Default::default()
+                        },
+                        None, // 保底 gas：FIFO 下不给
+                        confirm_timeout_secs,
+                    ),
                 ),
             )
             .await
             .map_err(into_tx_confirm_err);
         }
-        with_plan_ctx(&plan, strategy::dispatch_with_cost_v1(self, ixs, ctx, plan.route, config, confirm_timeout_secs))
-            .await
-            .map_err(into_tx_confirm_err)
+        scoped_by_ctx(
+            ctx,
+            with_plan_ctx(&plan, strategy::dispatch_with_cost_v1(self, ixs, ctx, plan.route, config, confirm_timeout_secs)),
+        )
+        .await
+        .map_err(into_tx_confirm_err)
     }
 
     /// V1 版 [`send_flashblock_only`]。只用 FlashBlock 发一笔，fire-and-forget。
@@ -1400,9 +1526,11 @@ impl<O: SlotOracle> TxDispacher<O> {
         config: V1TxConfig,
     ) -> Option<solana_sdk::signature::Signature> {
         let client = self.flash_block.as_ref()?;
-        let mut sigs = ahash::AHashSet::new();
-        fire::fire_v1_client(client, ixs, ctx, None, config, None, &mut sigs);
-        sigs.into_iter().next()
+        sync_scoped_by_ctx(ctx, || {
+            let mut sigs = ahash::AHashSet::new();
+            fire::fire_v1_client(client, ixs, ctx, None, config, None, &mut sigs);
+            sigs.into_iter().next()
+        })
     }
 }
 
@@ -1915,6 +2043,83 @@ mod tests {
         };
         let d = TxDispacher::builder(oracle).build();
         assert_eq!(d.resolve_route(100), SendRoute::Fallback);
+    }
+
+    // ── 备用 key（key profile）──────────────────────────────────────────────
+
+    /// **保活不能被 alt key 影响**：key 只是鉴权凭据，endpoint 不随 key 变化，
+    /// 所以挂上备用 key 前后，保活目标列表必须逐条一致（含顺序与去重结果）。
+    #[cfg(feature = "astralane")]
+    #[test]
+    fn alt_key_profile_does_not_change_keep_alive_targets() {
+        use sol_tx_send::platform_clients::astralane::Astralane;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt, Region::Amsterdam],
+        };
+        let primary = || RegionPool::build(&profile, |r| Astralane::init_with("default-key", r));
+
+        let without = TxDispacher::builder(NoopOracle).astralane_pool(primary()).build();
+        let with_alt = TxDispacher::builder(NoopOracle)
+            .astralane_pool(
+                ChannelPool::new(primary()).with_alt(
+                    "alt",
+                    RegionPool::build(&profile, |r| Astralane::init_with("alt-key", r)),
+                ),
+            )
+            .build();
+
+        // 地区池是 HashMap，`keep_alive_targets` 的输出顺序本身不稳定（同一次启动内
+        // 才稳定），所以这里比较**集合**：重点是不能多出/少掉目标。
+        let collect = |d: &TxDispacher<NoopOracle>| {
+            let mut v: Vec<(String, String)> = d
+                .keep_alive_targets()
+                .iter()
+                .map(|t| (t.name.to_string(), t.url.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let a = collect(&without);
+        let b = collect(&with_alt);
+        assert_eq!(a, b, "备用 key 不该改变保活目标（也不该多 ping 一次同一 origin）");
+        assert!(!a.is_empty());
+    }
+
+    /// 启动日志要能看出「这个平台挂了几个备用 key」，否则线上很难确认配置生效。
+    #[cfg(feature = "astralane")]
+    #[test]
+    fn channels_report_key_profiles() {
+        use sol_tx_send::platform_clients::astralane::Astralane;
+
+        let profile = RegionProfile {
+            own_region: Region::Frankfurt,
+            fanout: vec![Region::Frankfurt],
+        };
+        let d = TxDispacher::builder(NoopOracle)
+            .astralane_pool(
+                ChannelPool::new(RegionPool::build(&profile, |r| Astralane::init_with("k", r)))
+                    .with_alt("alt", RegionPool::build(&profile, |r| Astralane::init_with("k2", r))),
+            )
+            .build();
+
+        let a = d.channels().into_iter().find(|c| c.platform == "Astralane").expect("应有 Astralane");
+        assert_eq!(a.key_profiles, vec!["alt".to_string()]);
+    }
+
+    /// `SendContext::with_key_profile` 只影响被 clone 出来的那份上下文。
+    #[test]
+    fn send_context_key_profile_is_per_call() {
+        let base = empty_ctx();
+        assert!(base.key_profile.is_none());
+
+        let alt = base.clone().with_key_profile("alt");
+        assert_eq!(alt.key_profile.as_ref().map(|p| p.as_str()), Some("alt"));
+        assert!(base.key_profile.is_none(), "原 ctx 不能被改");
+
+        let back = alt.without_key_profile();
+        assert!(back.key_profile.is_none());
     }
 
     // ── TipStrategy 单元测试 ──────────────────────────────────────────────────

@@ -983,7 +983,12 @@ async fn fire_all_parallel(
                 let region = crate::region_pool::current_region();
                 let slot = crate::region_pool::current_slot();
                 let gas_lamports = crate::fire::v0_gas_lamports(cu);
-                handles.push(tokio::spawn(async move {
+                // build 在 spawn 出来的 task 里做，task-local 不会继承 —— 必须显式带过去，
+                // 否则会「用 alt key 算 tip / 用默认 key 建交易并发送」，而且无声无息。
+                let key_profile = crate::channel_pool::current_key_profile();
+                handles.push(tokio::spawn(crate::channel_pool::with_optional_key_profile(
+                    key_profile.clone(),
+                    async move {
                     let memo_ref: Option<&str> = memo.as_deref();
                     let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
                     match c.build_v0_tx(&ixs, &payer, &tip, &hash_param, &cu, &alt, memo_vec) {
@@ -1002,12 +1007,15 @@ async fn fire_all_parallel(
                             );
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
+                            let key_profile_for_send = key_profile.clone();
                             tokio::spawn(async move {
                                 // 与 fire_client 一致：task-local 不跨 spawn，发送前重新 scope。
-                                let res = match region {
-                                    Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
-                                    None => sender.send_tx(&tx).await,
-                                };
+                                let res = crate::channel_pool::with_send_scope(
+                                    region,
+                                    key_profile_for_send,
+                                    sender.send_tx(&tx),
+                                )
+                                .await;
                                 if let Err(e) = res {
                                     log::error!(
                                         "[par] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
@@ -1033,7 +1041,8 @@ async fn fire_all_parallel(
                             );
                         }
                     }
-                }));
+                },
+                )));
             }
         };
     }
@@ -2003,7 +2012,10 @@ async fn fire_all_parallel_v1(
                 let sigs = sigs_shared.clone();
                 let region = crate::region_pool::current_region();
                 let slot = crate::region_pool::current_slot();
-                handles.push(tokio::spawn(async move {
+                let key_profile = crate::channel_pool::current_key_profile();
+                handles.push(tokio::spawn(crate::channel_pool::with_optional_key_profile(
+                    key_profile.clone(),
+                    async move {
                     let memo_ref: Option<&str> = memo.as_deref();
                     let memo_vec: Option<Vec<&str>> = memo_ref.map(|m| vec![m]);
                     match c.build_v1_tx(&ixs, &payer, &tip, &hash_param, config, memo_vec) {
@@ -2021,11 +2033,14 @@ async fn fire_all_parallel_v1(
                             );
                             sigs.lock().unwrap().push(sig);
                             let sender = Arc::clone(&c);
+                            let key_profile_for_send = key_profile.clone();
                             tokio::spawn(async move {
-                                let res = match region {
-                                    Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
-                                    None => sender.send_tx(&tx).await,
-                                };
+                                let res = crate::channel_pool::with_send_scope(
+                                    region,
+                                    key_profile_for_send,
+                                    sender.send_tx(&tx),
+                                )
+                                .await;
                                 if let Err(e) = res {
                                     log::error!(
                                         "[par-v1] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
@@ -2051,7 +2066,8 @@ async fn fire_all_parallel_v1(
                             );
                         }
                     }
-                }));
+                },
+                )));
             }
         };
     }

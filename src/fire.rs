@@ -42,6 +42,9 @@ pub fn fire_client<C>(
 {
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
     let region = crate::region_pool::current_region();
+    // key profile 同样是 task-local，必须带进 spawn 出来的发送 task；否则 alt key
+    // 只在 build 阶段生效、真正 send 时退回默认 key（而且无声无息）。
+    let key_profile = crate::channel_pool::current_key_profile();
     let slot = crate::region_pool::current_slot();
     let cu_params = *cu;
     let gas_lamports = v0_gas_lamports(cu_params);
@@ -91,10 +94,7 @@ pub fn fire_client<C>(
     // `tokio::spawn` 继承，不重新 scope 的话 RegionPool 只会看到 None 并退回 own。
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
-        let res = match region {
-            Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
-            None => sender.send_tx(&tx).await,
-        };
+        let res = crate::channel_pool::with_send_scope(region, key_profile, sender.send_tx(&tx)).await;
         if let Err(e) = res {
             log::error!(
                 "[fire] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",
@@ -139,6 +139,7 @@ pub fn fire_v1_client<C>(
 
     // ① build（借用 *client），提取 sig + tx，TxEnvelope 在 block 尾部 drop
     let region = crate::region_pool::current_region();
+    let key_profile = crate::channel_pool::current_key_profile();
     let slot = crate::region_pool::current_slot();
     let build_t0 = std::time::Instant::now();
     let (sig, tx) = {
@@ -183,10 +184,7 @@ pub fn fire_v1_client<C>(
     let platform = client.to_string();
     tokio::spawn(async move {
         let send_t0 = std::time::Instant::now();
-        let res = match region {
-            Some(r) => crate::region_pool::with_region(r, sender.send_tx(&tx)).await,
-            None => sender.send_tx(&tx).await,
-        };
+        let res = crate::channel_pool::with_send_scope(region, key_profile, sender.send_tx(&tx)).await;
         if let Err(e) = res {
             log::error!(
                 "[fire-v1] {} send failed: {} (slot={:?} region_hint={:?} tip={:?} sig={})",

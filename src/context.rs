@@ -5,22 +5,55 @@
 //! （老代码里的 `trade-solana-impl::send_utils::TxSenderContext` 是同一套字段的早期版本，
 //!   已存在的调用点保留不动，新写的直接用这里。）
 
+use crate::channel_pool::KeyProfile;
 use sol_tx_send::platform_clients::HashParam;
 use solana_sdk::{message::AddressLookupTableAccount, pubkey::Pubkey, signature::Keypair, signer::Signer};
 use std::sync::Arc;
 
-/// 发送上下文：payer、hash（nonce / blockhash）、ALT。
+/// 发送上下文：payer、hash（nonce / blockhash）、ALT、可选的 key profile。
 #[derive(Clone)]
 pub struct SendContext {
     pub payer: Arc<Keypair>,
     pub hash_param: HashParam,
     /// 地址查找表（无 ALT 时传 `Arc::new(vec![])`）
     pub alt: Arc<Vec<AddressLookupTableAccount>>,
+    /// 这次发送用哪组平台 key；`None` = 默认 key。
+    ///
+    /// 由 [`SendContext::with_key_profile`] 设置，`send*` 入口会自动把它 scope 进
+    /// 本次发送（见 `channel_pool` 模块）。**只影响本次调用**，不改全局状态，
+    /// 也不影响保活。
+    pub key_profile: Option<KeyProfile>,
 }
 
 impl SendContext {
     pub fn new(payer: Arc<Keypair>, hash_param: HashParam, alt: Arc<Vec<AddressLookupTableAccount>>) -> Self {
-        Self { payer, hash_param, alt }
+        Self {
+            payer,
+            hash_param,
+            alt,
+            key_profile: None,
+        }
+    }
+
+    /// 让**这次发送**改用某个备用 key profile（如 `"alt"`），返回新 ctx。
+    ///
+    /// 只覆盖该 profile 里真正配了 key 的平台，其余平台继续用默认 key
+    /// （见 `channel_pool` 模块的「稀疏覆盖」）。典型用法：
+    ///
+    /// ```rust,ignore
+    /// let alt_ctx = ctx.with_key_profile("alt");
+    /// dispacher.send_v1(&ixs, &alt_ctx, slot, cfg, 60).await?;
+    /// // 别处继续 dispacher.send_v1(&ixs, &ctx, ..) 走默认 key
+    /// ```
+    pub fn with_key_profile(mut self, profile: impl Into<KeyProfile>) -> Self {
+        self.key_profile = Some(profile.into());
+        self
+    }
+
+    /// 去掉 key profile，回到默认 key。
+    pub fn without_key_profile(mut self) -> Self {
+        self.key_profile = None;
+        self
     }
 
     /// 使用 nonce 账户构建，自动查询最新 hash（**不带 ALT**）。
@@ -47,6 +80,7 @@ impl SendContext {
             },
             payer,
             alt: Arc::new(alt),
+            key_profile: None,
         }
     }
 
@@ -70,6 +104,7 @@ impl SendContext {
             hash_param: HashParam::Blockhash(hash),
             payer,
             alt: Arc::new(alt),
+            key_profile: None,
         })
     }
 
