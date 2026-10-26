@@ -49,15 +49,13 @@ pub fn fire_client<C>(
     let cu_params = *cu;
     let gas_lamports = v0_gas_lamports(cu_params);
     let build_t0 = std::time::Instant::now();
-    let (sig, tx, clone_elapsed) = {
+    let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
         match client.build_v0_tx(ixs, payer, &tip, hash_param, &cu_params, alt, memo_vec) {
             Ok(env) => {
                 let sig = env.sig();
-                let t_clone = std::time::Instant::now();
                 let tx = env.inner_tx().clone();
-                let clone_elapsed = t_clone.elapsed();
-                (sig, tx, clone_elapsed)
+                (sig, tx)
                 // env dropped here → 借用释放
             }
             Err(e) => {
@@ -79,7 +77,7 @@ pub fn fire_client<C>(
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
     log::info!(
-        "[fire] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={} build={:?} clone={:?}",
+        "[fire] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={} build={:?}",
         client,
         slot,
         region,
@@ -87,8 +85,7 @@ pub fn fire_client<C>(
         cu_params,
         gas_lamports,
         sig,
-        build_elapsed,
-        clone_elapsed
+        build_elapsed
     );
 
     let sender = Arc::clone(client);
@@ -145,15 +142,13 @@ pub fn fire_v1_client<C>(
     let key_profile = crate::channel_pool::current_key_profile();
     let slot = crate::region_pool::current_slot();
     let build_t0 = std::time::Instant::now();
-    let (sig, tx, clone_elapsed) = {
+    let (sig, tx) = {
         let memo_vec: Option<Vec<&str>> = memo.map(|m| vec![m]);
         match client.build_v1_tx(ixs, payer, &tip, hash_param, config, memo_vec) {
             Ok(env) => {
                 let sig = env.sig();
-                let t_clone = std::time::Instant::now();
                 let tx = env.inner_tx().clone();
-                let clone_elapsed = t_clone.elapsed();
-                (sig, tx, clone_elapsed)
+                (sig, tx)
                 // env dropped here → 借用释放
             }
             Err(e) => {
@@ -175,15 +170,14 @@ pub fn fire_v1_client<C>(
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
     log::info!(
-        "[fire-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={} build={:?} clone={:?}",
+        "[fire-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={} build={:?}",
         client,
         slot,
         region,
         tip,
         config,
         sig,
-        build_elapsed,
-        clone_elapsed
+        build_elapsed
     );
 
     let sender = Arc::clone(client);
