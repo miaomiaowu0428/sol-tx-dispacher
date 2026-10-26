@@ -77,7 +77,7 @@ pub fn fire_client<C>(
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
     log::info!(
-        "[fire] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={} build={:?}",
+        "[fire] 🚀 {} slot={:?} region_hint={:?} tip={:?} cu={:?} gas_lamports={:?} sig={} build={:?} warm={}",
         client,
         slot,
         region,
@@ -85,7 +85,8 @@ pub fn fire_client<C>(
         cu_params,
         gas_lamports,
         sig,
-        build_elapsed
+        build_elapsed,
+        crate::warm::phase_tag()
     );
 
     let sender = Arc::clone(client);
@@ -170,14 +171,15 @@ pub fn fire_v1_client<C>(
     // ② 借用已释放，可以 clone Arc
     sigs.insert(sig);
     log::info!(
-        "[fire-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={} build={:?}",
+        "[fire-v1] 🚀 {} slot={:?} region_hint={:?} tip={:?} config={:?} sig={} build={:?} warm={}",
         client,
         slot,
         region,
         tip,
         config,
         sig,
-        build_elapsed
+        build_elapsed,
+        crate::warm::phase_tag()
     );
 
     let sender = Arc::clone(client);

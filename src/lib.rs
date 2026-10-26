@@ -31,6 +31,7 @@ mod fire;
 mod region_plan;
 mod region_pool;
 mod strategy;
+pub mod warm;
 
 pub use builder::TxDispacherBuilder;
 pub use channel_pool::{

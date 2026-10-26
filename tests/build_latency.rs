@@ -276,3 +276,108 @@ fn build_latency() {
         med(&mut cold) / med(&mut warm)
     );
 }
+
+// --------------------------- 1ms 级 warmer 的真实效果 ---------------------------
+
+/// 当前线程跑在哪个 CPU 上（/proc/thread-self/stat 第 39 字段）。
+fn my_cpu() -> u32 {
+    let s = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
+    s.rsplit(')')
+        .next()
+        .and_then(|r| r.split_whitespace().nth(36))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(999)
+}
+
+/// 空转到某个时刻（不睡眠，避免 nanosleep 的 50~100µs 抖动）。
+fn spin_until(deadline: Instant) {
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+fn med_of(v: &mut Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// 后台 warmer（周期可配）对“空闲 100ms 后那一笔”到底有没有帮助。
+///
+///   WARM_PERIOD_US=1000 taskset -c 2   cargo test ... warm_period -- --ignored --nocapture
+///   WARM_PERIOD_US=1000 taskset -c 2,3 cargo test ... warm_period -- --ignored --nocapture
+///
+/// 同时打印每次测量**实际的 gap**（距离 warmer 上一次签名多久），因为真正决定冷热的
+/// 就是这个 gap，而不是 warmer 的设定周期。
+#[test]
+#[ignore = "延迟基准：WARM_PERIOD_US=... taskset -c ... -- --ignored --nocapture"]
+fn warm_period() {
+    let period_us: u64 = std::env::var("WARM_PERIOD_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let period = Duration::from_micros(period_us);
+
+    let f = fixture();
+    for _ in 0..30 {
+        build_full(&f);
+    }
+
+    // 基线：没有 warmer
+    let mut base = Vec::new();
+    for _ in 0..21 {
+        std::thread::sleep(Duration::from_millis(100));
+        base.push(build_full(&f));
+    }
+
+    let epoch = Instant::now();
+    let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let warmer_cpu = Arc::new(std::sync::atomic::AtomicU32::new(999));
+
+    let (last2, stop2, cpu2) = (Arc::clone(&last), Arc::clone(&stop), Arc::clone(&warmer_cpu));
+    let w = fixture();
+    let h = std::thread::spawn(move || {
+        cpu2.store(my_cpu(), Ordering::Relaxed);
+        let mut next = Instant::now();
+        while !stop2.load(Ordering::Relaxed) {
+            build_full(&w);
+            last2.store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            next += period;
+            spin_until(next);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    warmer_cpu.store({ let c = warmer_cpu.load(Ordering::Relaxed); c }, Ordering::Relaxed);
+
+    let mut rows: Vec<(f64, f64)> = Vec::new();
+    for _ in 0..41 {
+        std::thread::sleep(Duration::from_millis(100));
+        let gap_us = (epoch.elapsed().as_nanos() as u64).saturating_sub(last.load(Ordering::Relaxed)) as f64 / 1000.0;
+        let d = build_full(&f);
+        rows.push((gap_us, d));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = h.join();
+
+    println!(
+        "\nwarmer 周期={period:?}  builder 核={}  warmer 核={}",
+        my_cpu(),
+        warmer_cpu.load(Ordering::Relaxed)
+    );
+    println!("  无 warmer（空闲100ms）p50 = {:.1}µs", med_of(&mut base));
+    let mut buckets: [(&str, f64, f64); 4] = [
+        ("gap < 0.3ms", 0.0, 300.0),
+        ("gap 0.3~0.8ms", 300.0, 800.0),
+        ("gap 0.8~1.5ms", 800.0, 1500.0),
+        ("gap > 1.5ms", 1500.0, 1e9),
+    ];
+    for (name, lo, hi) in buckets.iter_mut() {
+        let mut v: Vec<f64> = rows.iter().filter(|(g, _)| *g >= *lo && *g < *hi).map(|(_, d)| *d).collect();
+        let n = v.len();
+        println!("  有 warmer: {name:<15} n={n:>2}  p50={:>6.1}µs", med_of(&mut v));
+    }
+}
+
