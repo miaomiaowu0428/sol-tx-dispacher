@@ -441,6 +441,25 @@ impl<O: SlotOracle> TxDispacher<O> {
         // 启动时把“实际构造了哪些平台 / 哪些地区 / 哪些 key profile”打出来，
         // 方便核对 feature、key 与 TX_KEY_PROFILES。
         d.log_channels();
+
+        // 声明了 profile、但一个 `<ENV>_<PROFILE>` 都没配到 → 运行时用它会**静默回退
+        // 默认 key**（稀疏覆盖的代价）。这里提前告警，避免「以为换了 key 其实没换」。
+        if !key_profiles.is_empty() {
+            let registered: std::collections::HashSet<String> = d
+                .channels()
+                .iter()
+                .flat_map(|c| c.key_profiles.iter().cloned())
+                .collect();
+            for p in &key_profiles {
+                if !registered.contains(p.as_str()) {
+                    log::warn!(
+                        "[TxDispacher] key profile {p} 没有匹配到任何凭据（未配置任何 <ENV>_{}），用它会静默回退默认 key",
+                        p.env_suffix()
+                    );
+                }
+            }
+        }
+
         d
     }
 }
