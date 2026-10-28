@@ -31,6 +31,7 @@ mod fire;
 mod region_plan;
 mod region_pool;
 mod strategy;
+mod tip_window;
 pub mod warm;
 
 pub use builder::TxDispacherBuilder;
@@ -44,6 +45,7 @@ pub use region_plan::{
 pub use region_pool::{RegionPool, SEND_REGION, with_region};
 pub use bundle::{MultiBundleError, MultiBundleErrorV1, MultiBundleSender, MultiBundleSenderV1};
 pub use context::{SendContext, merge_alts};
+pub use tip_window::{TipWindowError, TipWindowOutcome, TipWindowPlan};
 
 use fifo::FIFO_LEADERS;
 use nonce_cache::TxConfirmError;
