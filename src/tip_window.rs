@@ -119,8 +119,13 @@ impl TipWindowPlan {
     pub const DEFAULT_DURATION: Duration = Duration::from_millis(1200);
     /// 默认最小间隔（`7 `HIGHFEE_LL_MIN_GAP_MS`）。
     pub const DEFAULT_MIN_GAP: Duration = Duration::from_millis(20);
-    /// 默认确认尾巴（`7 `HIGHFEE_LL_TAIL_MS`）。
-    pub const DEFAULT_TAIL: Duration = Duration::from_millis(300);
+    /// 默认确认尾巴：**5s**。
+    ///
+    /// 「发送窗口」和「等待窗口」是两个独立的东西：`duration` 决定多快发完（以及哪些笔数还有意义），
+    /// `tail` 决定发完之后还等多久。链上窗口（`check_slot`）通常只有 1~2s，晚到的交易**必然失败**，
+    /// 所以 `tail` 长一点也不会有「晚成交」的风险 —— 它唯一的用途是接住「**已经落地、但确认通知迟到**」的成交。
+    /// 这个方向上的偏差是**单向安全**的：多等只会多等，少等会把「买到了」判成超时。
+    pub const DEFAULT_TAIL: Duration = Duration::from_millis(5_000);
     /// 重平台（nodeone / astralane / landx 三系）的默认配额（`7 `HIGHFEE_LL_HEAVY_QUOTA`）。
     pub const DEFAULT_HEAVY_QUOTA: usize = 5;
 
@@ -1361,7 +1366,11 @@ mod tests {
         assert_eq!(s.total, 20);
         assert_eq!(s.step, Duration::from_millis(60));
         assert_eq!(s.span, Duration::from_millis(1200));
-        assert_eq!(s.deadline, Duration::from_millis(1500), "span + tail(300ms)");
+        assert_eq!(
+            s.deadline,
+            s.span + TipWindowPlan::DEFAULT_TAIL,
+            "deadline = span + tail(默认 5s)"
+        );
         assert!(!s.stretched);
         // 3 个重平台分 20 笔：至少各 4 笔，且总数对得上
         assert!(s.quotas[0] >= 4 && s.quotas[1] >= 4 && s.quotas[2] >= 4, "{:?}", s.quotas);
