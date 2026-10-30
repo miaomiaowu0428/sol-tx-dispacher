@@ -1854,4 +1854,52 @@ mod tests {
         assert_eq!(by_platform.get("Jito"), Some(&1));
         assert!(!by_platform.contains_key("Astralane"), "HTTP 通道不该再发: {by_platform:?}");
     }
+    /// 全局结果通道的**接线**：假平台在 `send_tx` 里就广播「这一笔成交了」，
+    /// 窗口必须能在同一次窗口里把它认出来（`Landed`），而不是等满 deadline。
+    ///
+    /// 注意这只证明「发送→广播→窗口识别」这条链是通的；**订阅早于发送**是结构保证
+    /// （`run_with_clients` 里 `subscribe()` 在 `run_window` 之前、且是同步注册），
+    /// 不是靠这个测试的调度顺序。
+    #[tokio::test]
+    async fn subscribes_before_the_first_send() {
+        struct EchoSuccess;
+
+        #[async_trait::async_trait]
+        impl SendTx for EchoSuccess {
+            async fn send_tx(&self, tx: &VersionedTransaction) -> Result<(), String> {
+                let sig = tx.signatures.first().copied().ok_or("没有签名")?;
+                // 发出去的同一条 fiber 里立刻回报成交（模拟「上链极快」）
+                let _ = tx_result_channel::send(ev_success(sig));
+                Ok(())
+            }
+        }
+
+        let client = ClientRef {
+            display: "NodeOne".to_string(),
+            min_tip: 1_000,
+            max_tip: None,
+            uses_tip_transfer: true,
+            build: Box::new(|_, _, _, _, _, _| {
+                let sig = Signature::new_unique();
+                let mut tx = Transaction::default();
+                tx.signatures = vec![sig];
+                Ok((sig, VersionedTransaction::from(tx)))
+            }),
+            sender: Arc::new(EchoSuccess),
+        };
+
+        // 只发 1 笔、tail 40ms：事件一旦丢了，40ms 后必然 Timeout（测试不会卡）。
+        let window = TipWindowPlan::new(Some(1_000), 100_000)
+            .with_count(1)
+            .with_duration(Duration::from_millis(20))
+            .with_tail(Duration::from_millis(40));
+
+        let out = run_with_clients(&[client], &[], &blockhash_ctx(), window, Region::Frankfurt, None)
+            .await
+            .expect("窗口应该正常跑完");
+        assert!(
+            matches!(out, TipWindowOutcome::Landed { .. }),
+            "订阅必须早于第一笔发送，否则这里是 Timeout：{out:?}"
+        );
+    }
 }
